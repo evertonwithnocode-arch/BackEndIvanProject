@@ -11,3 +11,5 @@ langchain-text-splitters
 chromadb
 openai
 tiktoken
+
+pydantic
