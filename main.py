@@ -39,18 +39,26 @@ if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY não encontrada")
 
 # -------------------------------
-# EMBEDDINGS + VECTOR STORE
+# EMBEDDINGS
 # -------------------------------
 embeddings = OpenAIEmbeddings(
     model="text-embedding-3-small",
     api_key=OPENAI_API_KEY
 )
 
-vector_store = Chroma(
-    persist_directory=PERSIST_DIR,
-    embedding_function=embeddings
-)
+# -------------------------------
+# VECTOR STORE DINÂMICO
+# -------------------------------
+def get_vector_store(project_id: str):
+    return Chroma(
+        collection_name=project_id,
+        persist_directory=PERSIST_DIR,
+        embedding_function=embeddings
+    )
 
+# -------------------------------
+# TEXT SPLITTER
+# -------------------------------
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=CHUNK_SIZE,
     chunk_overlap=CHUNK_OVERLAP
@@ -71,9 +79,11 @@ llm = ChatOpenAI(
 jobs = {}
 
 # -------------------------------
-# RAG: RECUPERAR CONTEXTO
+# RAG: CONTEXTO POR PROJETO
 # -------------------------------
-def get_context(query: str, k: int = 10):
+def get_context(query: str, project_id: str, k: int = 10):
+    vector_store = get_vector_store(project_id)
+
     docs = vector_store.similarity_search(query, k=k)
 
     context = "\n\n".join([
@@ -147,14 +157,17 @@ class SummaryRequest(BaseModel):
     query: Optional[str] = "gerar sumário geral"
     enrichment: Optional[Dict] = None
     k: Optional[int] = 10
+    project_id: str
 
 # -------------------------------
 # WORKER
 # -------------------------------
-def process_job(job_id: str, files_data: List[dict]):
+def process_job(job_id: str, files_data: List[dict], project_id: str):
 
     job = jobs[job_id]
     job["status"] = "processing"
+
+    vector_store = get_vector_store(project_id)
 
     total_files = len(files_data)
     job["total_files"] = total_files
@@ -174,7 +187,8 @@ def process_job(job_id: str, files_data: List[dict]):
             all_chunks.append(chunk)
             all_metadata.append({
                 "source": filename,
-                "chunk_index": idx
+                "chunk_index": idx,
+                "project_id": project_id
             })
 
         job["progress"] = int((i + 1) / total_files * 50)
@@ -200,10 +214,13 @@ def process_job(job_id: str, files_data: List[dict]):
     job["progress"] = 100
 
 # -------------------------------
-# UPLOAD
+# UPLOAD (COM PROJECT_ID)
 # -------------------------------
 @app.post("/upload")
-async def upload_documents(files: List[UploadFile] = File(...)):
+async def upload_documents(
+    project_id: str,
+    files: List[UploadFile] = File(...)
+):
 
     job_id = str(uuid.uuid4())
     files_data = []
@@ -225,15 +242,20 @@ async def upload_documents(files: List[UploadFile] = File(...)):
         "progress": 0,
         "stage": "upload",
         "total_files": len(files_data),
-        "processed_files": 0
+        "processed_files": 0,
+        "project_id": project_id
     }
 
-    thread = threading.Thread(target=process_job, args=(job_id, files_data))
+    thread = threading.Thread(
+        target=process_job,
+        args=(job_id, files_data, project_id)
+    )
     thread.start()
 
     return {
         "success": True,
-        "job_id": job_id
+        "job_id": job_id,
+        "project_id": project_id
     }
 
 # -------------------------------
@@ -249,15 +271,18 @@ def get_status(job_id: str):
     return job
 
 # -------------------------------
-# SEARCH
+# SEARCH (POR PROJETO)
 # -------------------------------
 @app.post("/search")
-async def search(query: str, k: int = 5):
+async def search(query: str, project_id: str, k: int = 5):
+
+    vector_store = get_vector_store(project_id)
 
     results = vector_store.similarity_search(query, k=k)
 
     return {
         "query": query,
+        "project_id": project_id,
         "results": [
             {
                 "text": doc.page_content,
@@ -273,21 +298,19 @@ async def search(query: str, k: int = 5):
 @app.post("/generate-summary")
 async def generate_summary(req: SummaryRequest):
 
-    # 1. RAG
-    context = get_context(req.query, req.k)
+    context = get_context(req.query, req.project_id, req.k)
 
-    # 2. Prompt
     prompt = build_prompt(
         template=req.template,
         context=context,
         enrichment=req.enrichment
     )
 
-    # 3. LLM
     response = llm.invoke(prompt)
 
     return {
         "summary": response.content,
         "query": req.query,
+        "project_id": req.project_id,
         "chunks_used": req.k
     }
