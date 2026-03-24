@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-dotenv
+python-multipart
+langchain
+langchain-openai
+langchain-chroma
+chromadb
+tiktoken
