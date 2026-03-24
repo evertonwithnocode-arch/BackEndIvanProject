@@ -4,9 +4,10 @@ load_dotenv()
 import os
 import uuid
 import threading
+import traceback
 from typing import List, Optional, Dict
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -17,11 +18,11 @@ from langchain_chroma import Chroma
 app = FastAPI()
 
 # -------------------------------
-# CORS
+# CORS (CORRIGIDO PRA PRODUÇÃO)
 # -------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # depois restringe
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,7 +37,7 @@ PERSIST_DIR = "./chroma_db"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY não encontrada")
+    raise Exception("OPENAI_API_KEY não encontrada")
 
 # -------------------------------
 # EMBEDDINGS
@@ -47,14 +48,17 @@ embeddings = OpenAIEmbeddings(
 )
 
 # -------------------------------
-# VECTOR STORE DINÂMICO
+# VECTOR STORE POR PROJETO
 # -------------------------------
 def get_vector_store(project_id: str):
-    return Chroma(
-        collection_name=project_id,
-        persist_directory=PERSIST_DIR,
-        embedding_function=embeddings
-    )
+    try:
+        return Chroma(
+            collection_name=project_id,
+            persist_directory=PERSIST_DIR,
+            embedding_function=embeddings
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao acessar vector store: {str(e)}")
 
 # -------------------------------
 # TEXT SPLITTER
@@ -79,22 +83,27 @@ llm = ChatOpenAI(
 jobs = {}
 
 # -------------------------------
-# RAG: CONTEXTO POR PROJETO
+# RAG
 # -------------------------------
 def get_context(query: str, project_id: str, k: int = 10):
-    vector_store = get_vector_store(project_id)
+    try:
+        vector_store = get_vector_store(project_id)
+        docs = vector_store.similarity_search(query, k=k)
 
-    docs = vector_store.similarity_search(query, k=k)
+        if not docs:
+            return "Nenhum dado encontrado para este projeto."
 
-    context = "\n\n".join([
-        f"[Fonte: {doc.metadata.get('source')} | Chunk: {doc.metadata.get('chunk_index')}]\n{doc.page_content}"
-        for doc in docs
-    ])
+        context = "\n\n".join([
+            f"[Fonte: {doc.metadata.get('source')} | Chunk: {doc.metadata.get('chunk_index')}]\n{doc.page_content}"
+            for doc in docs
+        ])
 
-    return context
+        return context
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar contexto: {str(e)}")
 
 # -------------------------------
-# PROMPT BUILDER
+# PROMPT
 # -------------------------------
 def build_prompt(template: str, context: str, enrichment: dict | None):
 
@@ -107,10 +116,8 @@ DADOS DE ENRIQUECIMENTO
 {enrichment}
 """
 
-    prompt = f"""
+    return f"""
 Você é um especialista em análise de documentos SPED.
-
-Gere um sumário analítico COMPLETO.
 
 ====================
 CONTEXTO
@@ -120,7 +127,7 @@ CONTEXTO
 {enrichment_text}
 
 ====================
-INSTRUÇÕES DO USUÁRIO
+INSTRUÇÕES
 ====================
 {template}
 
@@ -128,26 +135,17 @@ INSTRUÇÕES DO USUÁRIO
 REGRAS
 ====================
 - Gere insights relevantes
-- Faça cruzamento de dados
 - Identifique inconsistências
-- Sugira oportunidades fiscais
-- Inclua justificativas
-- Cite as fontes (arquivo + trecho)
-- Estruture a resposta
+- Faça cruzamentos
+- Cite fontes (arquivo + trecho)
+- Seja objetivo
 
 ====================
-FORMATO DE SAÍDA
+FORMATO
 ====================
-Responda em JSON com:
-
-- insights
-- inconsistencias
-- oportunidades
-- analises
-- referencias
+JSON com:
+insights, inconsistencias, oportunidades, analises, referencias
 """
-
-    return prompt
 
 # -------------------------------
 # REQUEST MODEL
@@ -156,107 +154,101 @@ class SummaryRequest(BaseModel):
     template: str
     query: Optional[str] = "gerar sumário geral"
     enrichment: Optional[Dict] = None
-    k: Optional[int] = 10
+    k: Optional[int] = 5
     project_id: str
 
 # -------------------------------
 # WORKER
 # -------------------------------
 def process_job(job_id: str, files_data: List[dict], project_id: str):
+    try:
+        job = jobs[job_id]
+        job["status"] = "processing"
 
-    job = jobs[job_id]
-    job["status"] = "processing"
+        vector_store = get_vector_store(project_id)
 
-    vector_store = get_vector_store(project_id)
+        all_chunks = []
+        all_metadata = []
 
-    total_files = len(files_data)
-    job["total_files"] = total_files
+        job["stage"] = "chunking"
 
-    all_chunks = []
-    all_metadata = []
+        for i, file in enumerate(files_data):
+            chunks = text_splitter.split_text(file["text"])
 
-    job["stage"] = "chunking"
+            for idx, chunk in enumerate(chunks):
+                all_chunks.append(chunk)
+                all_metadata.append({
+                    "source": file["filename"],
+                    "chunk_index": idx,
+                    "project_id": project_id
+                })
 
-    for i, file in enumerate(files_data):
-        text = file["text"]
-        filename = file["filename"]
+            job["progress"] = int((i + 1) / len(files_data) * 50)
 
-        chunks = text_splitter.split_text(text)
+        job["stage"] = "embedding"
 
-        for idx, chunk in enumerate(chunks):
-            all_chunks.append(chunk)
-            all_metadata.append({
-                "source": filename,
-                "chunk_index": idx,
-                "project_id": project_id
-            })
+        BATCH_SIZE = 100
 
-        job["progress"] = int((i + 1) / total_files * 50)
+        for i in range(0, len(all_chunks), BATCH_SIZE):
+            vector_store.add_texts(
+                texts=all_chunks[i:i+BATCH_SIZE],
+                metadatas=all_metadata[i:i+BATCH_SIZE]
+            )
 
-    job["stage"] = "embedding"
+            job["progress"] = 50 + int((i / len(all_chunks)) * 50)
 
-    BATCH_SIZE = 100
-    total_chunks = len(all_chunks)
+        job["status"] = "completed"
+        job["stage"] = "done"
+        job["progress"] = 100
 
-    for i in range(0, total_chunks, BATCH_SIZE):
-        batch_chunks = all_chunks[i:i + BATCH_SIZE]
-        batch_meta = all_metadata[i:i + BATCH_SIZE]
-
-        vector_store.add_texts(
-            texts=batch_chunks,
-            metadatas=batch_meta
-        )
-
-        job["progress"] = 50 + int((i + BATCH_SIZE) / total_chunks * 50)
-
-    job["status"] = "completed"
-    job["stage"] = "done"
-    job["progress"] = 100
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)
+        print(traceback.format_exc())
 
 # -------------------------------
-# UPLOAD (COM PROJECT_ID)
+# UPLOAD
 # -------------------------------
 @app.post("/upload")
-async def upload_documents(
-    project_id: str,
-    files: List[UploadFile] = File(...)
-):
+async def upload_documents(project_id: str, files: List[UploadFile] = File(...)):
+    try:
+        if not project_id:
+            raise HTTPException(status_code=400, detail="project_id é obrigatório")
 
-    job_id = str(uuid.uuid4())
-    files_data = []
+        job_id = str(uuid.uuid4())
+        files_data = []
 
-    for file in files:
-        content = await file.read()
-        text = content.decode("utf-8", errors="ignore")
+        for file in files:
+            content = await file.read()
+            text = content.decode("utf-8", errors="ignore")
 
-        if not text.strip():
-            continue
+            if text.strip():
+                files_data.append({
+                    "filename": file.filename,
+                    "text": text
+                })
 
-        files_data.append({
-            "filename": file.filename,
-            "text": text
-        })
+        if not files_data:
+            raise HTTPException(status_code=400, detail="Nenhum arquivo válido enviado")
 
-    jobs[job_id] = {
-        "status": "pending",
-        "progress": 0,
-        "stage": "upload",
-        "total_files": len(files_data),
-        "processed_files": 0,
-        "project_id": project_id
-    }
+        jobs[job_id] = {
+            "status": "pending",
+            "progress": 0,
+            "stage": "upload",
+            "project_id": project_id
+        }
 
-    thread = threading.Thread(
-        target=process_job,
-        args=(job_id, files_data, project_id)
-    )
-    thread.start()
+        threading.Thread(
+            target=process_job,
+            args=(job_id, files_data, project_id)
+        ).start()
 
-    return {
-        "success": True,
-        "job_id": job_id,
-        "project_id": project_id
-    }
+        return {"job_id": job_id, "project_id": project_id}
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------------
 # STATUS
@@ -266,51 +258,33 @@ def get_status(job_id: str):
     job = jobs.get(job_id)
 
     if not job:
-        return {"error": "Job não encontrado"}
+        raise HTTPException(status_code=404, detail="Job não encontrado")
 
     return job
 
 # -------------------------------
-# SEARCH (POR PROJETO)
-# -------------------------------
-@app.post("/search")
-async def search(query: str, project_id: str, k: int = 5):
-
-    vector_store = get_vector_store(project_id)
-
-    results = vector_store.similarity_search(query, k=k)
-
-    return {
-        "query": query,
-        "project_id": project_id,
-        "results": [
-            {
-                "text": doc.page_content,
-                "metadata": doc.metadata
-            }
-            for doc in results
-        ]
-    }
-
-# -------------------------------
-# GENERATE SUMMARY (RAG + IA)
+# SUMMARY
 # -------------------------------
 @app.post("/generate-summary")
 async def generate_summary(req: SummaryRequest):
+    try:
+        context = get_context(req.query, req.project_id, req.k)
 
-    context = get_context(req.query, req.project_id, req.k)
+        # 🔥 PROTEÇÃO TOKEN
+        context = context[:12000]
 
-    prompt = build_prompt(
-        template=req.template,
-        context=context,
-        enrichment=req.enrichment
-    )
+        prompt = build_prompt(req.template, context, req.enrichment)
 
-    response = llm.invoke(prompt)
+        response = llm.invoke(prompt)
 
-    return {
-        "summary": response.content,
-        "query": req.query,
-        "project_id": req.project_id,
-        "chunks_used": req.k
-    }
+        return {
+            "summary": response.content,
+            "project_id": req.project_id
+        }
+
+    except Exception as e:
+        print(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao gerar resumo: {str(e)}"
+        )
