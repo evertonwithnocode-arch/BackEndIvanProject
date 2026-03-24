@@ -18,11 +18,11 @@ from langchain_chroma import Chroma
 app = FastAPI()
 
 # -------------------------------
-# CORS (CORRIGIDO PRA PRODUÇÃO)
+# CORS
 # -------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # depois restringe
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,7 +48,7 @@ embeddings = OpenAIEmbeddings(
 )
 
 # -------------------------------
-# VECTOR STORE POR PROJETO
+# VECTOR STORE
 # -------------------------------
 def get_vector_store(project_id: str):
     try:
@@ -58,10 +58,10 @@ def get_vector_store(project_id: str):
             embedding_function=embeddings
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao acessar vector store: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro vector store: {str(e)}")
 
 # -------------------------------
-# TEXT SPLITTER
+# SPLITTER
 # -------------------------------
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=CHUNK_SIZE,
@@ -78,7 +78,7 @@ llm = ChatOpenAI(
 )
 
 # -------------------------------
-# JOB STORAGE
+# JOBS
 # -------------------------------
 jobs = {}
 
@@ -99,6 +99,7 @@ def get_context(query: str, project_id: str, k: int = 10):
         ])
 
         return context
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao buscar contexto: {str(e)}")
 
@@ -116,7 +117,7 @@ DADOS DE ENRIQUECIMENTO
 {enrichment}
 """
 
-    return f"""
+    prompt = f"""
 Você é um especialista em análise de documentos SPED.
 
 ====================
@@ -137,7 +138,7 @@ REGRAS
 - Gere insights relevantes
 - Identifique inconsistências
 - Faça cruzamentos
-- Cite fontes (arquivo + trecho)
+- Cite fontes
 - Seja objetivo
 
 ====================
@@ -147,8 +148,10 @@ JSON com:
 insights, inconsistencias, oportunidades, analises, referencias
 """
 
+    return prompt
+
 # -------------------------------
-# REQUEST MODEL
+# REQUEST
 # -------------------------------
 class SummaryRequest(BaseModel):
     template: str
@@ -213,7 +216,7 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
 async def upload_documents(project_id: str, files: List[UploadFile] = File(...)):
     try:
         if not project_id:
-            raise HTTPException(status_code=400, detail="project_id é obrigatório")
+            raise HTTPException(status_code=400, detail="project_id obrigatório")
 
         job_id = str(uuid.uuid4())
         files_data = []
@@ -229,7 +232,7 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
                 })
 
         if not files_data:
-            raise HTTPException(status_code=400, detail="Nenhum arquivo válido enviado")
+            raise HTTPException(status_code=400, detail="Nenhum arquivo válido")
 
         jobs[job_id] = {
             "status": "pending",
@@ -245,8 +248,6 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
 
         return {"job_id": job_id, "project_id": project_id}
 
-    except HTTPException as e:
-        raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -263,17 +264,29 @@ def get_status(job_id: str):
     return job
 
 # -------------------------------
-# SUMMARY
+# SUMMARY (COM LOGS 🔥)
 # -------------------------------
 @app.post("/generate-summary")
 async def generate_summary(req: SummaryRequest):
     try:
         context = get_context(req.query, req.project_id, req.k)
 
-        # 🔥 PROTEÇÃO TOKEN
+        # 🔥 LOGS IMPORTANTES
+        print("===================================")
+        print("📊 DEBUG TAMANHO")
+        print("Project:", req.project_id)
+        print("Query:", req.query)
+        print("Chunks solicitados (k):", req.k)
+        print("Context size:", len(context))
+        print("Enrichment size:", len(str(req.enrichment)) if req.enrichment else 0)
+
+        # 🔥 LIMITE HARD
         context = context[:12000]
 
         prompt = build_prompt(req.template, context, req.enrichment)
+
+        print("Prompt size:", len(prompt))
+        print("===================================")
 
         response = llm.invoke(prompt)
 
@@ -283,7 +296,9 @@ async def generate_summary(req: SummaryRequest):
         }
 
     except Exception as e:
+        print("🔥 ERRO NO SUMMARY")
         print(traceback.format_exc())
+
         raise HTTPException(
             status_code=500,
             detail=f"Erro ao gerar resumo: {str(e)}"
