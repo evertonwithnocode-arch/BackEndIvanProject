@@ -1,0 +1,5 @@
+.env
+# Chroma DB
+data/chroma_db/
+chroma_db/
+*.sqlite3
