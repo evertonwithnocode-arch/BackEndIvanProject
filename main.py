@@ -17,6 +17,10 @@ from langchain_chroma import Chroma
 from chromadb import Client
 from chromadb.config import Settings
 import shutil
+import asyncio
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import math
+
 
 app = FastAPI()
 
@@ -258,37 +262,69 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
         job["status"] = "processing"
 
         vector_store = get_vector_store(project_id)
-
         all_chunks = []
         all_metadata = []
 
+        # --- ETAPA 1: CHUNKING (CPU-BOUND com MULTI-CORE) ---
         job["stage"] = "chunking"
+        
+        # Splitter local para evitar problemas de serialização entre processos
+        local_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP
+        )
 
-        for i, file in enumerate(files_data):
-            chunks = text_splitter.split_text(file["text"])
+        with ProcessPoolExecutor() as executor:
+            texts = [f["text"] for f in files_data]
+            # Divide o trabalho de picar os textos entre todos os núcleos da CPU
+            results = list(executor.map(local_splitter.split_text, texts))
 
+        for i, chunks in enumerate(results):
+            filename = files_data[i]["filename"]
             for idx, chunk in enumerate(chunks):
                 all_chunks.append(chunk)
                 all_metadata.append({
-                    "source": file["filename"],
+                    "source": filename,
                     "chunk_index": idx,
                     "project_id": project_id
                 })
+        
+        job["progress"] = 50
 
-            job["progress"] = int((i + 1) / len(files_data) * 50)
-
+        # --- ETAPA 2: EMBEDDING & CHROMA (CONCORRENTE com CONTROLE DE TAXA) ---
         job["stage"] = "embedding"
+        
+        # Reduzimos para 100 para não estourar o limite de tokens por requisição (TPM)
+        BATCH_SIZE = 100 
+        num_chunks = len(all_chunks)
+        num_batches = (num_chunks + BATCH_SIZE - 1) // BATCH_SIZE
 
-        BATCH_SIZE = 500
-
-        for i in range(0, len(all_chunks), BATCH_SIZE):
+        def add_batch(batch_idx):
+            start = batch_idx * BATCH_SIZE
+            end = min(start + BATCH_SIZE, num_chunks)
+            
+            # O LangChain enviará para a OpenAI e salvará no Chroma local
             vector_store.add_texts(
-                texts=all_chunks[i:i+BATCH_SIZE],
-                metadatas=all_metadata[i:i+BATCH_SIZE]
+                texts=all_chunks[start:end],
+                metadatas=all_metadata[start:end]
             )
+            return batch_idx
 
-            job["progress"] = 50 + int((i / len(all_chunks)) * 50)
+        # Usamos apenas 2 workers para evitar o RateLimitError 429.
+        # Isso ainda é mais rápido que o seu código original porque envia o próximo lote 
+        # enquanto o anterior ainda está sendo escrito no disco pelo Chroma.
+        with ThreadPoolExecutor(max_workers=2) as t_executor:
+            futures = []
+            for i in range(num_batches):
+                futures.append(t_executor.submit(add_batch, i))
+            
+            # Monitora o progresso conforme cada lote termina
+            for idx, future in enumerate(futures):
+                # O .result() garante que se der erro na thread, o Python nos avise aqui
+                future.result() 
+                job["progress"] = 50 + int(((idx + 1) / num_batches) * 50)
 
+        # Finalização
         job["status"] = "completed"
         job["stage"] = "done"
         job["progress"] = 100
@@ -296,6 +332,7 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
+        print(f"Erro Crítico no Job {job_id}:")
         print(traceback.format_exc())
 
 # -------------------------------
@@ -308,21 +345,33 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
             raise HTTPException(status_code=400, detail="project_id obrigatório")
 
         job_id = str(uuid.uuid4())
-        files_data = []
 
-        for file in files:
+        # Função auxiliar para processar cada arquivo individualmente de forma assíncrona
+        async def process_single_file(file: UploadFile):
+            # Leitura assíncrona do conteúdo
             content = await file.read()
+            # Decodificação (aqui você já ganha tempo processando enquanto outros leem)
             text = content.decode("utf-8", errors="ignore")
-
+            
             if text.strip():
-                files_data.append({
+                return {
                     "filename": file.filename,
                     "text": text
-                })
+                }
+            return None
+
+        # --- O PONTO CHAVE: Upload Paralelo e Assíncrono ---
+        # asyncio.gather dispara todas as corrotinas ao mesmo tempo
+        # Em vez de esperar arquivo por arquivo, o Python gerencia o I/O de todos simultaneamente
+        results = await asyncio.gather(*[process_single_file(f) for f in files])
+
+        # Filtra arquivos que retornaram None (vazios)
+        files_data = [res for res in results if res is not None]
 
         if not files_data:
             raise HTTPException(status_code=400, detail="Nenhum arquivo válido")
 
+        # Registro do Job
         jobs[job_id] = {
             "status": "pending",
             "progress": 0,
@@ -330,6 +379,8 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
             "project_id": project_id
         }
 
+        # Inicia o processamento pesado (Chunking/Embedding) em uma thread separada
+        # para não bloquear a resposta do endpoint
         threading.Thread(
             target=process_job,
             args=(job_id, files_data, project_id)
@@ -338,8 +389,8 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
         return {"job_id": job_id, "project_id": project_id}
 
     except Exception as e:
+        # Se algo falhar no gather ou no processamento inicial
         raise HTTPException(status_code=500, detail=str(e))
-
 # -------------------------------
 # STATUS
 # -------------------------------
