@@ -21,6 +21,17 @@ import asyncio
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import math
 import time
+from supabase import create_client
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # 🔥 usar service role!
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    raise Exception("Credenciais do Supabase não encontradas")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+BUCKET_NAME = "sped-documents"
 
 
 app = FastAPI()
@@ -402,29 +413,47 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
 
 
 @app.delete("/delete-project/{project_id}")
-def delete_project(project_id: str):
+def delete_project(project_id: str, folder_path: str):
     try:
         if not project_id:
             raise HTTPException(status_code=400, detail="project_id obrigatório")
 
+        if not folder_path:
+            raise HTTPException(status_code=400, detail="folder_path obrigatório")
+
+        # -------------------------------
+        # 🔥 1. DELETAR STORAGE (SUPABASE)
+        # -------------------------------
+        try:
+            files = supabase.storage.from_(BUCKET_NAME).list(path=folder_path)
+
+            if files:
+                paths = [
+                    f"{folder_path.rstrip('/')}/{file['name']}"
+                    for file in files
+                ]
+
+                supabase.storage.from_(BUCKET_NAME).remove(paths)
+            else:
+                print(f"⚠️ Nenhum arquivo encontrado em {folder_path}")
+
+        except Exception as e:
+            print("⚠️ Erro ao deletar storage:", str(e))
+
+        # -------------------------------
+        # 🔥 2. DELETAR CHROMA (LOCAL)
+        # -------------------------------
         project_path = os.path.join(PERSIST_DIR, project_id)
 
-        # 🔥 DELETE TOTAL DIRETO
         if os.path.exists(project_path):
             shutil.rmtree(project_path)
         else:
-            raise HTTPException(
-                status_code=404,
-                detail="Projeto não encontrado"
-            )
+            print("⚠️ Pasta local não encontrada (ok)")
 
         return {
             "status": "success",
-            "message": f"Projeto {project_id} deletado COMPLETAMENTE"
+            "message": f"Project {project_id} + folder {folder_path} deletados"
         }
-
-    except HTTPException:
-        raise
 
     except Exception as e:
         print("🔥 ERRO AO DELETAR PROJECT")
@@ -435,6 +464,7 @@ def delete_project(project_id: str):
             detail=f"Erro ao deletar projeto: {str(e)}"
         )
 
+        
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
