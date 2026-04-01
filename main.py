@@ -422,37 +422,41 @@ def delete_project(project_id: str, folder_path: str):
             raise HTTPException(status_code=400, detail="folder_path obrigatório")
 
         # -------------------------------
-        # 🔥 1. DELETAR STORAGE (SUPABASE)
+        # 🔥 1. DELETAR STORAGE (LOOP)
         # -------------------------------
         try:
-            files = supabase.storage.from_(BUCKET_NAME).list(path=folder_path)
+            while True:
+                files = supabase.storage.from_(BUCKET_NAME).list(path=folder_path)
 
-            if files:
+                if not files:
+                    break  # acabou tudo
+
                 paths = [
                     f"{folder_path.rstrip('/')}/{file['name']}"
                     for file in files
                 ]
 
                 supabase.storage.from_(BUCKET_NAME).remove(paths)
-            else:
-                print(f"⚠️ Nenhum arquivo encontrado em {folder_path}")
+
+                print(f"🗑️ Deletados {len(paths)} arquivos...")
+
+                # 🔥 pequena pausa pra evitar rate limit
+                time.sleep(0.2)
 
         except Exception as e:
             print("⚠️ Erro ao deletar storage:", str(e))
 
         # -------------------------------
-        # 🔥 2. DELETAR CHROMA (LOCAL)
+        # 🔥 2. DELETAR CHROMA
         # -------------------------------
         project_path = os.path.join(PERSIST_DIR, project_id)
 
         if os.path.exists(project_path):
             shutil.rmtree(project_path)
-        else:
-            print("⚠️ Pasta local não encontrada (ok)")
 
         return {
             "status": "success",
-            "message": f"Project {project_id} + folder {folder_path} deletados"
+            "message": f"Project {project_id} + folder {folder_path} deletados completamente"
         }
 
     except Exception as e:
@@ -464,7 +468,6 @@ def delete_project(project_id: str, folder_path: str):
             detail=f"Erro ao deletar projeto: {str(e)}"
         )
 
-        
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
