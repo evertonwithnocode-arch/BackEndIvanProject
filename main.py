@@ -38,15 +38,34 @@ app = FastAPI()
 
 from fastapi.responses import Response
 
+from fastapi import Request
+
+from fastapi.responses import JSONResponse
+
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
+
+if not INTERNAL_API_KEY:
+    raise Exception("INTERNAL_API_KEY não configurada")
+
+PUBLIC_ROUTES = ["/status"]
+
 @app.middleware("http")
-async def add_cors_headers(request, call_next):
-    response: Response = await call_next(request)
+async def verify_api_key(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
 
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "*"
+    if any(request.url.path.startswith(route) for route in PUBLIC_ROUTES):
+        return await call_next(request)
 
-    return response
+    api_key = request.headers.get("x-api-key")
+
+    if api_key != INTERNAL_API_KEY:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized"}
+        )
+
+    return await call_next(request)
 
 
 # -------------------------------
