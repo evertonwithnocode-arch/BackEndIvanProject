@@ -17,10 +17,6 @@ from langchain_chroma import Chroma
 from chromadb import Client
 from chromadb.config import Settings
 import shutil
-import asyncio
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-import math
-
 
 app = FastAPI()
 
@@ -262,64 +258,36 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
         job["status"] = "processing"
 
         vector_store = get_vector_store(project_id)
+
         all_chunks = []
         all_metadata = []
 
-        # --- ETAPA 1: CHUNKING (CPU-BOUND) ---
         job["stage"] = "chunking"
-        
-        # Dica: Criar o splitter aqui ou garantir que ele seja instanciado globalmente
-        # mas usado localmente evita erros de serialização entre processos.
-        local_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP
-        )
 
-        with ProcessPoolExecutor() as executor:
-            texts = [f["text"] for f in files_data]
-            # Usamos a função split_text do splitter local
-            results = list(executor.map(local_splitter.split_text, texts))
+        for i, file in enumerate(files_data):
+            chunks = text_splitter.split_text(file["text"])
 
-        for i, chunks in enumerate(results):
-            filename = files_data[i]["filename"]
             for idx, chunk in enumerate(chunks):
                 all_chunks.append(chunk)
                 all_metadata.append({
-                    "source": filename,
+                    "source": file["filename"],
                     "chunk_index": idx,
                     "project_id": project_id
                 })
-        
-        job["progress"] = 50
 
-        # --- ETAPA 2: EMBEDDING & CHROMA (I/O-BOUND) ---
+            job["progress"] = int((i + 1) / len(files_data) * 50)
+
         job["stage"] = "embedding"
-        
-        BATCH_SIZE = 1000 
-        num_chunks = len(all_chunks)
-        # Calcula quantos lotes teremos no total
-        num_batches = (num_chunks + BATCH_SIZE - 1) // BATCH_SIZE
 
-        # Sub-função para processar cada lote
-        def add_batch(batch_idx):
-            start = batch_idx * BATCH_SIZE
-            end = min(start + BATCH_SIZE, num_chunks)
-            
+        BATCH_SIZE = 500
+
+        for i in range(0, len(all_chunks), BATCH_SIZE):
             vector_store.add_texts(
-                texts=all_chunks[start:end],
-                metadatas=all_metadata[start:end]
+                texts=all_chunks[i:i+BATCH_SIZE],
+                metadatas=all_metadata[i:i+BATCH_SIZE]
             )
-            return batch_idx
 
-        # Otimização com ThreadPool para disparar lotes em paralelo
-        # Enquanto a OpenAI processa um lote, o Python já envia o próximo
-        with ThreadPoolExecutor(max_workers=5) as t_executor:
-            # Enviamos todos os lotes para a fila de execução
-            list(t_executor.map(add_batch, range(num_batches)))
-            
-            # Nota: O progresso aqui pode ser refinado, mas para 100 arquivos 
-            # essa parte costuma ser muito veloz com threads.
-            job["progress"] = 90
+            job["progress"] = 50 + int((i / len(all_chunks)) * 50)
 
         job["status"] = "completed"
         job["stage"] = "done"
@@ -340,33 +308,21 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
             raise HTTPException(status_code=400, detail="project_id obrigatório")
 
         job_id = str(uuid.uuid4())
+        files_data = []
 
-        # Função auxiliar para processar cada arquivo individualmente de forma assíncrona
-        async def process_single_file(file: UploadFile):
-            # Leitura assíncrona do conteúdo
+        for file in files:
             content = await file.read()
-            # Decodificação (aqui você já ganha tempo processando enquanto outros leem)
             text = content.decode("utf-8", errors="ignore")
-            
+
             if text.strip():
-                return {
+                files_data.append({
                     "filename": file.filename,
                     "text": text
-                }
-            return None
-
-        # --- O PONTO CHAVE: Upload Paralelo e Assíncrono ---
-        # asyncio.gather dispara todas as corrotinas ao mesmo tempo
-        # Em vez de esperar arquivo por arquivo, o Python gerencia o I/O de todos simultaneamente
-        results = await asyncio.gather(*[process_single_file(f) for f in files])
-
-        # Filtra arquivos que retornaram None (vazios)
-        files_data = [res for res in results if res is not None]
+                })
 
         if not files_data:
             raise HTTPException(status_code=400, detail="Nenhum arquivo válido")
 
-        # Registro do Job
         jobs[job_id] = {
             "status": "pending",
             "progress": 0,
@@ -374,8 +330,6 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
             "project_id": project_id
         }
 
-        # Inicia o processamento pesado (Chunking/Embedding) em uma thread separada
-        # para não bloquear a resposta do endpoint
         threading.Thread(
             target=process_job,
             args=(job_id, files_data, project_id)
@@ -384,8 +338,8 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
         return {"job_id": job_id, "project_id": project_id}
 
     except Exception as e:
-        # Se algo falhar no gather ou no processamento inicial
         raise HTTPException(status_code=500, detail=str(e))
+
 # -------------------------------
 # STATUS
 # -------------------------------
