@@ -17,6 +17,8 @@ from langchain_chroma import Chroma
 from chromadb import Client
 from chromadb.config import Settings
 import shutil
+from fastapi import BackgroundTasks
+import aiofiles
 
 app = FastAPI()
 
@@ -296,78 +298,52 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
         job["error"] = str(e)
         print(traceback.format_exc())
 
-# -------------------------------
-# UPLOAD
-# -------------------------------
-@app.post("/upload")
-async def upload_documents(project_id: str, files: List[UploadFile] = File(...)):
-    try:
-        if not project_id:
-            raise HTTPException(status_code=400, detail="project_id obrigatório")
-
-        job_id = str(uuid.uuid4())
-
-        jobs[job_id] = {
-            "status": "processing",
-            "progress": 0,
-            "stage": "starting",
-            "project_id": project_id
-        }
-
-        threading.Thread(
-            target=process_job_streaming,
-            args=(job_id, files, project_id)
-        ).start()
-
-        return {"job_id": job_id, "project_id": project_id}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-def process_job_streaming(job_id: str, files: List[UploadFile], project_id: str):
+def process_job_streaming(job_id: str, file_paths: List[Dict[str, str]], project_id: str):
     try:
         job = jobs[job_id]
         vector_store = get_vector_store(project_id)
+        
+        batch_texts = []
+        batch_metadatas = []
+        BATCH_SIZE = 150  # Otimizado para OpenAI
+        
+        total_files = len(file_paths)
 
-        total_files = len(files)
+        for i, f_info in enumerate(file_paths):
+            path = f_info["path"]
+            filename = f_info["filename"]
+            
+            job["stage"] = f"processing_{filename}"
 
-        for i, file in enumerate(files):
-            job["stage"] = f"reading_{file.filename}"
+            # Lê do disco (não do objeto UploadFile que já estaria fechado)
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
 
-            # 🔥 LÊ 1 ARQUIVO POR VEZ
-            content = file.file.read()
-            text = content.decode("utf-8", errors="ignore")
+            if text.strip():
+                chunks = text_splitter.split_text(text)
+                for idx, chunk in enumerate(chunks):
+                    batch_texts.append(chunk)
+                    batch_metadatas.append({
+                        "source": filename,
+                        "chunk_index": idx,
+                        "project_id": project_id
+                    })
 
-            if not text.strip():
-                continue
+                    # Se atingir o lote, envia
+                    if len(batch_texts) >= BATCH_SIZE:
+                        vector_store.add_texts(texts=batch_texts, metadatas=batch_metadatas)
+                        batch_texts = []
+                        batch_metadatas = []
 
-            job["stage"] = f"chunking_{file.filename}"
-
-            chunks = text_splitter.split_text(text)
-
-            texts = []
-            metadatas = []
-
-            for idx, chunk in enumerate(chunks):
-                texts.append(chunk)
-                metadatas.append({
-                    "source": file.filename,
-                    "chunk_index": idx,
-                    "project_id": project_id
-                })
-
-            job["stage"] = f"embedding_{file.filename}"
-
-            BATCH_SIZE = 100
-
-            for j in range(0, len(texts), BATCH_SIZE):
-                vector_store.add_texts(
-                    texts=texts[j:j+BATCH_SIZE],
-                    metadatas=metadatas[j:j+BATCH_SIZE]
-                )
-
+            # Remove o arquivo temporário após processar
+            if os.path.exists(path):
+                os.remove(path)
+                
             job["progress"] = int(((i + 1) / total_files) * 100)
+
+        # Envia o restante
+        if batch_texts:
+            vector_store.add_texts(texts=batch_texts, metadatas=batch_metadatas)
 
         job["status"] = "completed"
         job["stage"] = "done"
@@ -377,6 +353,47 @@ def process_job_streaming(job_id: str, files: List[UploadFile], project_id: str)
         job["status"] = "error"
         job["error"] = str(e)
         print(traceback.format_exc())
+
+# -------------------------------
+# UPLOAD
+# -------------------------------
+@app.post("/upload")
+async def upload_documents(
+    project_id: str, 
+    background_tasks: BackgroundTasks, 
+    files: List[UploadFile] = File(...)
+):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id obrigatório")
+
+    job_id = str(uuid.uuid4())
+    temp_dir = f"/tmp/{job_id}"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    file_paths = []
+
+    # Salva os arquivos no disco o mais rápido possível
+    for file in files:
+        path = os.path.join(temp_dir, file.filename)
+        async with aiofiles.open(path, 'wb') as out_file:
+            content = await file.read()
+            await out_file.write(content)
+        file_paths.append({"filename": file.filename, "path": path})
+
+    jobs[job_id] = {
+        "status": "pending",
+        "progress": 0,
+        "stage": "upload_complete",
+        "project_id": project_id
+    }
+
+    # Inicia o processamento em background de forma segura
+    background_tasks.add_task(process_job_streaming, job_id, file_paths, project_id)
+
+    return {"job_id": job_id, "project_id": project_id}
+
+
+
 
 # -------------------------------
 # STATUS
