@@ -20,6 +20,7 @@ import shutil
 import asyncio
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import math
+import time
 
 
 app = FastAPI()
@@ -265,10 +266,8 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
         all_chunks = []
         all_metadata = []
 
-        # --- ETAPA 1: CHUNKING (CPU-BOUND com MULTI-CORE) ---
+        # --- ETAPA 1: CHUNKING ---
         job["stage"] = "chunking"
-        
-        # Splitter local para evitar problemas de serialização entre processos
         local_splitter = RecursiveCharacterTextSplitter(
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP
@@ -276,7 +275,6 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
 
         with ProcessPoolExecutor() as executor:
             texts = [f["text"] for f in files_data]
-            # Divide o trabalho de picar os textos entre todos os núcleos da CPU
             results = list(executor.map(local_splitter.split_text, texts))
 
         for i, chunks in enumerate(results):
@@ -291,40 +289,46 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
         
         job["progress"] = 50
 
-        # --- ETAPA 2: EMBEDDING & CHROMA (CONCORRENTE com CONTROLE DE TAXA) ---
+        # --- ETAPA 2: EMBEDDING COM RETRY E ESPAÇAMENTO ---
         job["stage"] = "embedding"
         
-        # Reduzimos para 100 para não estourar o limite de tokens por requisição (TPM)
         BATCH_SIZE = 100 
         num_chunks = len(all_chunks)
         num_batches = (num_chunks + BATCH_SIZE - 1) // BATCH_SIZE
 
         def add_batch(batch_idx):
-            start = batch_idx * BATCH_SIZE
-            end = min(start + BATCH_SIZE, num_chunks)
-            
-            # O LangChain enviará para a OpenAI e salvará no Chroma local
-            vector_store.add_texts(
-                texts=all_chunks[start:end],
-                metadatas=all_metadata[start:end]
-            )
-            return batch_idx
+            # Adicionamos uma lógica de tentativa (retry) para caso a API falhe
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    start = batch_idx * BATCH_SIZE
+                    end = min(start + BATCH_SIZE, num_chunks)
+                    vector_store.add_texts(
+                        texts=all_chunks[start:end],
+                        metadatas=all_metadata[start:end]
+                    )
+                    return batch_idx
+                except Exception as e:
+                    if "429" in str(e) and attempt < max_retries - 1:
+                        time.sleep(2 * (attempt + 1)) # Espera um pouco mais a cada erro
+                        continue
+                    raise e
 
-        # Usamos apenas 2 workers para evitar o RateLimitError 429.
-        # Isso ainda é mais rápido que o seu código original porque envia o próximo lote 
-        # enquanto o anterior ainda está sendo escrito no disco pelo Chroma.
-        with ThreadPoolExecutor(max_workers=2) as t_executor:
+        # Usamos apenas 1 worker para garantir ordem e evitar picos de TPM
+        # No seu Tier atual, a velocidade de 1 worker sequencial com lote de 100
+        # já será muito rápida e segura.
+        with ThreadPoolExecutor(max_workers=1) as t_executor:
             futures = []
             for i in range(num_batches):
                 futures.append(t_executor.submit(add_batch, i))
+                # --- O SEGREDO AQUI ---
+                # Pequena pausa de 0.2s entre o disparo de cada lote para suavizar o TPM
+                time.sleep(0.2) 
             
-            # Monitora o progresso conforme cada lote termina
             for idx, future in enumerate(futures):
-                # O .result() garante que se der erro na thread, o Python nos avise aqui
                 future.result() 
                 job["progress"] = 50 + int(((idx + 1) / num_batches) * 50)
 
-        # Finalização
         job["status"] = "completed"
         job["stage"] = "done"
         job["progress"] = 100
