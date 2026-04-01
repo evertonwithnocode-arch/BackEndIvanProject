@@ -259,35 +259,33 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
 
         vector_store = get_vector_store(project_id)
 
-        all_chunks = []
-        all_metadata = []
-
-        job["stage"] = "chunking"
+        total_files = len(files_data)
 
         for i, file in enumerate(files_data):
+            job["stage"] = f"processing_file_{i+1}"
+
+            # 🔥 1. CHUNK DO ARQUIVO ATUAL
             chunks = text_splitter.split_text(file["text"])
 
+            texts = []
+            metadatas = []
+
             for idx, chunk in enumerate(chunks):
-                all_chunks.append(chunk)
-                all_metadata.append({
+                texts.append(chunk)
+                metadatas.append({
                     "source": file["filename"],
                     "chunk_index": idx,
                     "project_id": project_id
                 })
 
-            job["progress"] = int((i + 1) / len(files_data) * 50)
-
-        job["stage"] = "embedding"
-
-        BATCH_SIZE = 500
-
-        for i in range(0, len(all_chunks), BATCH_SIZE):
+            # 🔥 2. EMBEDDING + SAVE IMEDIATO
             vector_store.add_texts(
-                texts=all_chunks[i:i+BATCH_SIZE],
-                metadatas=all_metadata[i:i+BATCH_SIZE]
+                texts=texts,
+                metadatas=metadatas
             )
 
-            job["progress"] = 50 + int((i / len(all_chunks)) * 50)
+            # 🔥 3. ATUALIZA PROGRESSO REAL
+            job["progress"] = int(((i + 1) / total_files) * 100)
 
         job["status"] = "completed"
         job["stage"] = "done"
