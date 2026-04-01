@@ -17,8 +17,10 @@ from langchain_chroma import Chroma
 from chromadb import Client
 from chromadb.config import Settings
 import shutil
-from fastapi import BackgroundTasks
-import aiofiles
+import asyncio
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import math
+
 
 app = FastAPI()
 
@@ -48,8 +50,8 @@ app.add_middleware(
 # -------------------------------
 # CONFIG
 # -------------------------------
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 100
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 200
 PERSIST_DIR = "/data/chroma_db"
 os.makedirs(PERSIST_DIR, exist_ok=True)
 
@@ -260,90 +262,64 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
         job["status"] = "processing"
 
         vector_store = get_vector_store(project_id)
-        total_files = len(files_data)
+        all_chunks = []
+        all_metadata = []
 
-        for i, file in enumerate(files_data):
-            job["stage"] = f"processing_file_{i+1}"
+        # --- ETAPA 1: CHUNKING (CPU-BOUND) ---
+        job["stage"] = "chunking"
+        
+        # Dica: Criar o splitter aqui ou garantir que ele seja instanciado globalmente
+        # mas usado localmente evita erros de serialização entre processos.
+        local_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP
+        )
 
-            chunks = text_splitter.split_text(file["text"])
+        with ProcessPoolExecutor() as executor:
+            texts = [f["text"] for f in files_data]
+            # Usamos a função split_text do splitter local
+            results = list(executor.map(local_splitter.split_text, texts))
 
-            texts = []
-            metadatas = []
-
+        for i, chunks in enumerate(results):
+            filename = files_data[i]["filename"]
             for idx, chunk in enumerate(chunks):
-                texts.append(chunk)
-                metadatas.append({
-                    "source": file["filename"],
+                all_chunks.append(chunk)
+                all_metadata.append({
+                    "source": filename,
                     "chunk_index": idx,
                     "project_id": project_id
                 })
-
-            # 🔥 BATCH (ESSENCIAL)
-            BATCH_SIZE = 100
-
-            for j in range(0, len(texts), BATCH_SIZE):
-                vector_store.add_texts(
-                    texts=texts[j:j+BATCH_SIZE],
-                    metadatas=metadatas[j:j+BATCH_SIZE]
-                )
-
-            job["progress"] = int(((i + 1) / total_files) * 100)
-
-        job["status"] = "completed"
-        job["stage"] = "done"
-        job["progress"] = 100
-
-    except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
-        print(traceback.format_exc())
-
-def process_job_streaming(job_id: str, file_paths: List[Dict[str, str]], project_id: str):
-    try:
-        job = jobs[job_id]
-        vector_store = get_vector_store(project_id)
         
-        batch_texts = []
-        batch_metadatas = []
-        BATCH_SIZE = 150  # Otimizado para OpenAI
-        
-        total_files = len(file_paths)
+        job["progress"] = 50
 
-        for i, f_info in enumerate(file_paths):
-            path = f_info["path"]
-            filename = f_info["filename"]
+        # --- ETAPA 2: EMBEDDING & CHROMA (I/O-BOUND) ---
+        job["stage"] = "embedding"
+        
+        BATCH_SIZE = 1000 
+        num_chunks = len(all_chunks)
+        # Calcula quantos lotes teremos no total
+        num_batches = (num_chunks + BATCH_SIZE - 1) // BATCH_SIZE
+
+        # Sub-função para processar cada lote
+        def add_batch(batch_idx):
+            start = batch_idx * BATCH_SIZE
+            end = min(start + BATCH_SIZE, num_chunks)
             
-            job["stage"] = f"processing_{filename}"
+            vector_store.add_texts(
+                texts=all_chunks[start:end],
+                metadatas=all_metadata[start:end]
+            )
+            return batch_idx
 
-            # Lê do disco (não do objeto UploadFile que já estaria fechado)
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                text = f.read()
-
-            if text.strip():
-                chunks = text_splitter.split_text(text)
-                for idx, chunk in enumerate(chunks):
-                    batch_texts.append(chunk)
-                    batch_metadatas.append({
-                        "source": filename,
-                        "chunk_index": idx,
-                        "project_id": project_id
-                    })
-
-                    # Se atingir o lote, envia
-                    if len(batch_texts) >= BATCH_SIZE:
-                        vector_store.add_texts(texts=batch_texts, metadatas=batch_metadatas)
-                        batch_texts = []
-                        batch_metadatas = []
-
-            # Remove o arquivo temporário após processar
-            if os.path.exists(path):
-                os.remove(path)
-                
-            job["progress"] = int(((i + 1) / total_files) * 100)
-
-        # Envia o restante
-        if batch_texts:
-            vector_store.add_texts(texts=batch_texts, metadatas=batch_metadatas)
+        # Otimização com ThreadPool para disparar lotes em paralelo
+        # Enquanto a OpenAI processa um lote, o Python já envia o próximo
+        with ThreadPoolExecutor(max_workers=5) as t_executor:
+            # Enviamos todos os lotes para a fila de execução
+            list(t_executor.map(add_batch, range(num_batches)))
+            
+            # Nota: O progresso aqui pode ser refinado, mas para 100 arquivos 
+            # essa parte costuma ser muito veloz com threads.
+            job["progress"] = 90
 
         job["status"] = "completed"
         job["stage"] = "done"
@@ -358,43 +334,58 @@ def process_job_streaming(job_id: str, file_paths: List[Dict[str, str]], project
 # UPLOAD
 # -------------------------------
 @app.post("/upload")
-async def upload_documents(
-    project_id: str, 
-    background_tasks: BackgroundTasks, 
-    files: List[UploadFile] = File(...)
-):
-    if not project_id:
-        raise HTTPException(status_code=400, detail="project_id obrigatório")
+async def upload_documents(project_id: str, files: List[UploadFile] = File(...)):
+    try:
+        if not project_id:
+            raise HTTPException(status_code=400, detail="project_id obrigatório")
 
-    job_id = str(uuid.uuid4())
-    temp_dir = f"/tmp/{job_id}"
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    file_paths = []
+        job_id = str(uuid.uuid4())
 
-    # Salva os arquivos no disco o mais rápido possível
-    for file in files:
-        path = os.path.join(temp_dir, file.filename)
-        async with aiofiles.open(path, 'wb') as out_file:
+        # Função auxiliar para processar cada arquivo individualmente de forma assíncrona
+        async def process_single_file(file: UploadFile):
+            # Leitura assíncrona do conteúdo
             content = await file.read()
-            await out_file.write(content)
-        file_paths.append({"filename": file.filename, "path": path})
+            # Decodificação (aqui você já ganha tempo processando enquanto outros leem)
+            text = content.decode("utf-8", errors="ignore")
+            
+            if text.strip():
+                return {
+                    "filename": file.filename,
+                    "text": text
+                }
+            return None
 
-    jobs[job_id] = {
-        "status": "pending",
-        "progress": 0,
-        "stage": "upload_complete",
-        "project_id": project_id
-    }
+        # --- O PONTO CHAVE: Upload Paralelo e Assíncrono ---
+        # asyncio.gather dispara todas as corrotinas ao mesmo tempo
+        # Em vez de esperar arquivo por arquivo, o Python gerencia o I/O de todos simultaneamente
+        results = await asyncio.gather(*[process_single_file(f) for f in files])
 
-    # Inicia o processamento em background de forma segura
-    background_tasks.add_task(process_job_streaming, job_id, file_paths, project_id)
+        # Filtra arquivos que retornaram None (vazios)
+        files_data = [res for res in results if res is not None]
 
-    return {"job_id": job_id, "project_id": project_id}
+        if not files_data:
+            raise HTTPException(status_code=400, detail="Nenhum arquivo válido")
 
+        # Registro do Job
+        jobs[job_id] = {
+            "status": "pending",
+            "progress": 0,
+            "stage": "upload",
+            "project_id": project_id
+        }
 
+        # Inicia o processamento pesado (Chunking/Embedding) em uma thread separada
+        # para não bloquear a resposta do endpoint
+        threading.Thread(
+            target=process_job,
+            args=(job_id, files_data, project_id)
+        ).start()
 
+        return {"job_id": job_id, "project_id": project_id}
 
+    except Exception as e:
+        # Se algo falhar no gather ou no processamento inicial
+        raise HTTPException(status_code=500, detail=str(e))
 # -------------------------------
 # STATUS
 # -------------------------------
