@@ -47,7 +47,7 @@ INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
 if not INTERNAL_API_KEY:
     raise Exception("INTERNAL_API_KEY não configurada")
 
-PUBLIC_ROUTES = ["/status"]
+PUBLIC_ROUTES = ["/status", "/docs", "/openapi.json"]
 
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
