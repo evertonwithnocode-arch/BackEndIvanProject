@@ -46,8 +46,8 @@ app.add_middleware(
 # -------------------------------
 # CONFIG
 # -------------------------------
-CHUNK_SIZE = 1500
-CHUNK_OVERLAP = 200
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 100
 PERSIST_DIR = "/data/chroma_db"
 os.makedirs(PERSIST_DIR, exist_ok=True)
 
@@ -279,7 +279,7 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
 
         job["stage"] = "embedding"
 
-        BATCH_SIZE = 100
+        BATCH_SIZE = 500
 
         for i in range(0, len(all_chunks), BATCH_SIZE):
             vector_store.add_texts(
