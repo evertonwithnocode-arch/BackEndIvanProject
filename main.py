@@ -306,37 +306,77 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
             raise HTTPException(status_code=400, detail="project_id obrigatório")
 
         job_id = str(uuid.uuid4())
-        files_data = []
-
-        for file in files:
-            content = await file.read()
-            text = content.decode("utf-8", errors="ignore")
-
-            if text.strip():
-                files_data.append({
-                    "filename": file.filename,
-                    "text": text
-                })
-
-        if not files_data:
-            raise HTTPException(status_code=400, detail="Nenhum arquivo válido")
 
         jobs[job_id] = {
-            "status": "pending",
+            "status": "processing",
             "progress": 0,
-            "stage": "upload",
+            "stage": "starting",
             "project_id": project_id
         }
 
         threading.Thread(
-            target=process_job,
-            args=(job_id, files_data, project_id)
+            target=process_job_streaming,
+            args=(job_id, files, project_id)
         ).start()
 
         return {"job_id": job_id, "project_id": project_id}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def process_job_streaming(job_id: str, files: List[UploadFile], project_id: str):
+    try:
+        job = jobs[job_id]
+        vector_store = get_vector_store(project_id)
+
+        total_files = len(files)
+
+        for i, file in enumerate(files):
+            job["stage"] = f"reading_{file.filename}"
+
+            # 🔥 LÊ 1 ARQUIVO POR VEZ
+            content = file.file.read()
+            text = content.decode("utf-8", errors="ignore")
+
+            if not text.strip():
+                continue
+
+            job["stage"] = f"chunking_{file.filename}"
+
+            chunks = text_splitter.split_text(text)
+
+            texts = []
+            metadatas = []
+
+            for idx, chunk in enumerate(chunks):
+                texts.append(chunk)
+                metadatas.append({
+                    "source": file.filename,
+                    "chunk_index": idx,
+                    "project_id": project_id
+                })
+
+            job["stage"] = f"embedding_{file.filename}"
+
+            BATCH_SIZE = 100
+
+            for j in range(0, len(texts), BATCH_SIZE):
+                vector_store.add_texts(
+                    texts=texts[j:j+BATCH_SIZE],
+                    metadatas=metadatas[j:j+BATCH_SIZE]
+                )
+
+            job["progress"] = int(((i + 1) / total_files) * 100)
+
+        job["status"] = "completed"
+        job["stage"] = "done"
+        job["progress"] = 100
+
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)
+        print(traceback.format_exc())
 
 # -------------------------------
 # STATUS
