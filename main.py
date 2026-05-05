@@ -1,4 +1,5 @@
 from dotenv import load_dotenv
+
 load_dotenv()
 
 import os
@@ -49,6 +50,7 @@ if not INTERNAL_API_KEY:
 
 PUBLIC_ROUTES = ["/status", "/docs", "/openapi.json"]
 
+
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
     if request.method == "OPTIONS":
@@ -60,10 +62,7 @@ async def verify_api_key(request: Request, call_next):
     api_key = request.headers.get("x-api-key")
 
     if api_key != INTERNAL_API_KEY:
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Unauthorized"}
-        )
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
     return await call_next(request)
 
@@ -93,15 +92,15 @@ if not OPENAI_API_KEY:
 # -------------------------------
 # EMBEDDINGS
 # -------------------------------
-embeddings = OpenAIEmbeddings(
-    model="text-embedding-3-small",
-    api_key=OPENAI_API_KEY
-)
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
+
 
 def run_multi_step_rag(query, project_id, template):
     vector_store = get_vector_store(project_id)
 
-    docs = vector_store.max_marginal_relevance_search(query, k=50, fetch_k=100)  # 🔥 aumenta MUITO
+    docs = vector_store.max_marginal_relevance_search(
+        query, k=50, fetch_k=100
+    )  # 🔥 aumenta MUITO
 
     partial_results = []
 
@@ -114,6 +113,10 @@ def run_multi_step_rag(query, project_id, template):
         - evidências
         Se não houver dado concreto, responda: "SEM EVIDÊNCIA"
         Texto:
+        DOCUMENTO: {doc.metadata.get("source")}
+        CHUNK: {doc.metadata.get("chunk_index")}
+
+        TEXTO:
         {doc.page_content}
         """
 
@@ -142,6 +145,7 @@ def run_multi_step_rag(query, project_id, template):
 
     return final.content
 
+
 # -------------------------------
 # VECTOR STORE
 # -------------------------------
@@ -152,36 +156,31 @@ def get_vector_store(project_id: str):
         return Chroma(
             collection_name="default",  # 🔥 sempre fixo agora
             persist_directory=project_path,  # 🔥 pasta por projeto
-            embedding_function=embeddings
+            embedding_function=embeddings,
         )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro vector store: {str(e)}")
 
 
-
 # -------------------------------
 # SPLITTER
 # -------------------------------
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=CHUNK_SIZE,
-    chunk_overlap=CHUNK_OVERLAP
+    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
 )
 
 # -------------------------------
 # LLM
 # -------------------------------
-llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0.2,
-    api_key=OPENAI_API_KEY
-)
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, api_key=OPENAI_API_KEY)
 
 # -------------------------------
 # JOBS
 # -------------------------------
 jobs = {}
 summary_jobs = {}
+
 
 # -------------------------------
 # RAG
@@ -194,15 +193,20 @@ def get_context(query: str, project_id: str, k: int = 10):
         if not docs:
             return "Nenhum dado encontrado para este projeto."
 
-        context = "\n\n".join([
-            f"[Fonte: {doc.metadata.get('source')} | Chunk: {doc.metadata.get('chunk_index')}]\n{doc.page_content}"
-            for doc in docs
-        ])
+        context = "\n\n".join(
+            [
+                f"[Fonte: {doc.metadata.get('source')} | Chunk: {doc.metadata.get('chunk_index')}]\n{doc.page_content}"
+                for doc in docs
+            ]
+        )
 
         return context
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao buscar contexto: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Erro ao buscar contexto: {str(e)}"
+        )
+
 
 # -------------------------------
 # PROMPT
@@ -322,6 +326,7 @@ Se não houver inconsistências, deixe isso claro.
 
     return prompt
 
+
 # -------------------------------
 # REQUEST
 # -------------------------------
@@ -331,6 +336,7 @@ class SummaryRequest(BaseModel):
     enrichment: Optional[Dict] = None
     k: Optional[int] = 20
     project_id: str
+
 
 # -------------------------------
 # WORKER
@@ -347,8 +353,7 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
         # --- ETAPA 1: CHUNKING ---
         job["stage"] = "chunking"
         local_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP
+            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
         )
 
         with ProcessPoolExecutor() as executor:
@@ -359,18 +364,16 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
             filename = files_data[i]["filename"]
             for idx, chunk in enumerate(chunks):
                 all_chunks.append(chunk)
-                all_metadata.append({
-                    "source": filename,
-                    "chunk_index": idx,
-                    "project_id": project_id
-                })
-        
+                all_metadata.append(
+                    {"source": filename, "chunk_index": idx, "project_id": project_id}
+                )
+
         job["progress"] = 50
 
         # --- ETAPA 2: EMBEDDING COM RETRY E ESPAÇAMENTO ---
         job["stage"] = "embedding"
-        
-        BATCH_SIZE = 100 
+
+        BATCH_SIZE = 100
         num_chunks = len(all_chunks)
         num_batches = (num_chunks + BATCH_SIZE - 1) // BATCH_SIZE
 
@@ -382,13 +385,14 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
                     start = batch_idx * BATCH_SIZE
                     end = min(start + BATCH_SIZE, num_chunks)
                     vector_store.add_texts(
-                        texts=all_chunks[start:end],
-                        metadatas=all_metadata[start:end]
+                        texts=all_chunks[start:end], metadatas=all_metadata[start:end]
                     )
                     return batch_idx
                 except Exception as e:
                     if "429" in str(e) and attempt < max_retries - 1:
-                        time.sleep(2 * (attempt + 1)) # Espera um pouco mais a cada erro
+                        time.sleep(
+                            2 * (attempt + 1)
+                        )  # Espera um pouco mais a cada erro
                         continue
                     raise e
 
@@ -401,10 +405,10 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
                 futures.append(t_executor.submit(add_batch, i))
                 # --- O SEGREDO AQUI ---
                 # Pequena pausa de 0.2s entre o disparo de cada lote para suavizar o TPM
-                time.sleep(0.2) 
-            
+                time.sleep(0.2)
+
             for idx, future in enumerate(futures):
-                future.result() 
+                future.result()
                 job["progress"] = 50 + int(((idx + 1) / num_batches) * 50)
 
         job["status"] = "completed"
@@ -416,6 +420,7 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
         job["error"] = str(e)
         print(f"Erro Crítico no Job {job_id}:")
         print(traceback.format_exc())
+
 
 # -------------------------------
 # UPLOAD
@@ -434,12 +439,9 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
             content = await file.read()
             # Decodificação (aqui você já ganha tempo processando enquanto outros leem)
             text = content.decode("utf-8", errors="ignore")
-            
+
             if text.strip():
-                return {
-                    "filename": file.filename,
-                    "text": text
-                }
+                return {"filename": file.filename, "text": text}
             return None
 
         # --- O PONTO CHAVE: Upload Paralelo e Assíncrono ---
@@ -458,14 +460,13 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
             "status": "pending",
             "progress": 0,
             "stage": "upload",
-            "project_id": project_id
+            "project_id": project_id,
         }
 
         # Inicia o processamento pesado (Chunking/Embedding) em uma thread separada
         # para não bloquear a resposta do endpoint
         threading.Thread(
-            target=process_job,
-            args=(job_id, files_data, project_id)
+            target=process_job, args=(job_id, files_data, project_id)
         ).start()
 
         return {"job_id": job_id, "project_id": project_id}
@@ -473,10 +474,11 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
     except Exception as e:
         # Se algo falhar no gather ou no processamento inicial
         raise HTTPException(status_code=500, detail=str(e))
+
+
 # -------------------------------
 # STATUS
 # -------------------------------
-
 
 
 @app.delete("/delete-project/{project_id}")
@@ -498,10 +500,7 @@ def delete_project(project_id: str, folder_path: str):
                 if not files:
                     break  # acabou tudo
 
-                paths = [
-                    f"{folder_path.rstrip('/')}/{file['name']}"
-                    for file in files
-                ]
+                paths = [f"{folder_path.rstrip('/')}/{file['name']}" for file in files]
 
                 supabase.storage.from_(BUCKET_NAME).remove(paths)
 
@@ -523,7 +522,7 @@ def delete_project(project_id: str, folder_path: str):
 
         return {
             "status": "success",
-            "message": f"Project {project_id} + folder {folder_path} deletados completamente"
+            "message": f"Project {project_id} + folder {folder_path} deletados completamente",
         }
 
     except Exception as e:
@@ -531,8 +530,7 @@ def delete_project(project_id: str, folder_path: str):
         print(traceback.format_exc())
 
         raise HTTPException(
-            status_code=500,
-            detail=f"Erro ao deletar projeto: {str(e)}"
+            status_code=500, detail=f"Erro ao deletar projeto: {str(e)}"
         )
 
 
@@ -554,6 +552,7 @@ def get_summary_status(job_id: str):
         raise HTTPException(status_code=404, detail="Summary job não encontrado")
 
     return job
+
 
 def process_summary_job(job_id: str, req: SummaryRequest):
     try:
@@ -606,9 +605,7 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
             # 🔥 REDUZIDO (menos ruído e menos hallucination)
             docs = vector_store.max_marginal_relevance_search(
-                req.query,
-                k=20,
-                fetch_k=40
+                req.query, k=20, fetch_k=40
             )
 
             print(f"[SUMMARY][{job_id}] Docs encontrados: {len(docs)}")
@@ -627,8 +624,10 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                 RETORNE JSON:
 
                 {{
-                  "evidencias": [
+                "evidencias": [
                     {{
+                      "documento": "{doc.metadata.get("source")}",
+                      "chunk": "{doc.metadata.get("chunk_index")}",
                       "registro": "",
                       "trecho": "",
                       "tipo": "financeiro | inconsistencia | fiscal"
@@ -667,8 +666,7 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
             # 🔥 limpa lixo comum
             filtered_results = [
-                r for r in partial_results
-                if "[]" not in r and "null" not in r.lower()
+                r for r in partial_results if "[]" not in r and "null" not in r.lower()
             ]
 
             print(f"[SUMMARY][{job_id}] após filtro: {len(filtered_results)}")
@@ -697,27 +695,37 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             {aggregated}
 
             ====================
-            REGRAS CRÍTICAS
+            REGRAS OBRIGATÓRIAS (CRÍTICAS)
             ====================
 
-            - PROIBIDO inventar valores
-            - PROIBIDO estimativas
-            - PROIBIDO linguagem genérica
+            1. TODA informação deve citar origem EXPLÍCITA
 
-            - TODO número deve ter origem explícita
+            Formato obrigatório:
 
-            - Se não houver dados suficientes:
-              → escrever: "Dado não disponível nos arquivos analisados"
+            "Segundo o documento [NOME_DO_DOCUMENTO], no trecho:
+            '[TRECHO]'
+            o valor identificado é X"
 
-            - Toda análise deve conter:
-              - trecho real
-              - registro (ex: A170, C100)
-              - explicação técnica
+            2. PROIBIDO:
+            - inventar valores
+            - estimar números
+            - generalizar sem evidência
+
+            3. TODO dado deve conter:
+            - documento de origem
+            - trecho literal
+            - explicação técnica
+
+            4. Se não houver evidência suficiente:
+            → escrever exatamente:
+            "Dado não disponível nos arquivos analisados"
+
+            5. NÃO produzir nenhuma afirmação sem citação
 
             ====================
             OBJETIVO
             ====================
-            Gerar relatório executivo baseado SOMENTE nas evidências acima.
+            Gerar relatório executivo 100% rastreável.
             """
 
             job["stage"] = "final_llm"
@@ -739,6 +747,7 @@ def process_summary_job(job_id: str, req: SummaryRequest):
         print(f"[SUMMARY][{job_id}] ❌ ERROR")
         print(traceback.format_exc())
 
+
 # -------------------------------
 # SUMMARY (COM LOGS 🔥)
 # -------------------------------
@@ -750,18 +759,12 @@ async def generate_summary(req: SummaryRequest):
         summary_jobs[job_id] = {
             "status": "pending",
             "stage": "created",
-            "project_id": req.project_id
+            "project_id": req.project_id,
         }
 
-        threading.Thread(
-            target=process_summary_job,
-            args=(job_id, req)
-        ).start()
+        threading.Thread(target=process_summary_job, args=(job_id, req)).start()
 
-        return {
-            "job_id": job_id,
-            "status": "started"
-        }
+        return {"job_id": job_id, "status": "started"}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
