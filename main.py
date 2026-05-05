@@ -98,7 +98,40 @@ embeddings = OpenAIEmbeddings(
     api_key=OPENAI_API_KEY
 )
 
+def run_multi_step_rag(query, project_id, template):
+    vector_store = get_vector_store(project_id)
 
+    docs = vector_store.max_marginal_relevance_search(query, k=50, fetch_k=100)  # 🔥 aumenta MUITO
+
+    partial_results = []
+
+    for doc in docs:
+        prompt = f"""
+        Extraia deste trecho:
+        - inconsistências
+        - valores financeiros
+        - padrões fiscais
+        - evidências
+
+        Texto:
+        {doc.page_content}
+        """
+
+        res = llm.invoke(prompt)
+        partial_results.append(res.content)
+
+    aggregated = "\n\n".join(partial_results)
+
+    final_prompt = f"""
+    {template}
+
+    BASE DE DADOS CONSOLIDADA:
+    {aggregated}
+    """
+
+    final = llm.invoke(final_prompt)
+
+    return final.content
 
 # -------------------------------
 # VECTOR STORE
@@ -137,8 +170,6 @@ llm = ChatOpenAI(
 # JOBS
 # -------------------------------
 jobs = {}
-
-
 
 # -------------------------------
 # RAG
