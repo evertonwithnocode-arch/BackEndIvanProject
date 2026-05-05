@@ -112,7 +112,7 @@ def run_multi_step_rag(query, project_id, template):
         - valores financeiros
         - padrões fiscais
         - evidências
-
+        Se não houver dado concreto, responda: "SEM EVIDÊNCIA"
         Texto:
         {doc.page_content}
         """
@@ -124,7 +124,16 @@ def run_multi_step_rag(query, project_id, template):
 
     final_prompt = f"""
     {template}
+    REGRAS CRÍTICAS:
 
+    - PROIBIDO inventar valores financeiros
+    - PROIBIDO estimativas sem cálculo explícito
+    - PROIBIDO linguagem genérica
+
+  - Cada insight deve conter:
+    - trecho real
+    - origem (arquivo + chunk)
+    - cálculo demonstrado
     BASE DE DADOS CONSOLIDADA:
     {aggregated}
     """
@@ -601,7 +610,13 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
             print(f"[SUMMARY][{job_id}] Docs encontrados: {len(docs)}")
 
-            partial_results = []
+            partial_results = [
+            r for r in partial_results
+            if "SEM EVIDÊNCIA" not in r
+            ]
+            print(f"[RAG] docs: {len(docs)}")
+            print(f"[RAG] partial válidos: {len(partial_results)}")
+            print(f"[RAG] aggregated size: {len(aggregated)}")
 
             for i, doc in enumerate(docs):
                 print(f"[SUMMARY][{job_id}] Processando doc {i+1}/{len(docs)}")
