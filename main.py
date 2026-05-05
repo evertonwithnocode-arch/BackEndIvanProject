@@ -702,9 +702,21 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
             Formato obrigatório:
 
-            "Segundo o documento [NOME_DO_DOCUMENTO], no trecho:
-            '[TRECHO]'
-            o valor identificado é X"
+            "FORMATO OBRIGATÓRIO:
+
+            Toda afirmação deve seguir exatamente:
+
+            "Dado identificado no documento: [NOME]
+            Trecho:
+            [COLAR TRECHO ORIGINAL]
+
+            Análise:
+            [explicação técnica]
+
+            Resultado:
+            [valor ou inconsistência]"
+
+            Se não seguir esse formato → resposta inválida"
 
             2. PROIBIDO:
             - inventar valores
