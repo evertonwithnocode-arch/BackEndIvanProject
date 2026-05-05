@@ -149,6 +149,8 @@ def get_vector_store(project_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro vector store: {str(e)}")
 
+
+
 # -------------------------------
 # SPLITTER
 # -------------------------------
@@ -170,6 +172,7 @@ llm = ChatOpenAI(
 # JOBS
 # -------------------------------
 jobs = {}
+summary_jobs = {}
 
 # -------------------------------
 # RAG
@@ -533,75 +536,143 @@ def get_status(job_id: str):
 
     return job
 
-# -------------------------------
-# SUMMARY (COM LOGS 🔥)
-# -------------------------------
-@app.post("/generate-summary")
-async def generate_summary(req: SummaryRequest):
-    print("===================================")
-    print("🚀 INÍCIO DO SUMMARY")
-    print(f"Project: {req.project_id}")
-    print(f"Query: {req.query}")
-    print(f"Template size: {len(req.template)}")
-    print("===================================")
+
+@app.get("/summary-status/{job_id}")
+def get_summary_status(job_id: str):
+    job = summary_jobs.get(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Summary job não encontrado")
+
+    return job
+
+def process_summary_job(job_id: str, req: SummaryRequest):
     try:
-        # 🔥 DETECTA O MODO
+        job = summary_jobs[job_id]
+
+        job["status"] = "processing"
+        job["stage"] = "starting"
+        print(f"[SUMMARY][{job_id}] 🚀 START")
+
+        # -------------------------------
+        # 🔥 DETECT MODE
+        # -------------------------------
         if "DOCUMENTO 1" in req.template:
             mode = "strategic"
         else:
             mode = "audit"
 
-        print(f"🧠 Modo detectado: {mode}")
+        job["mode"] = mode
+        print(f"[SUMMARY][{job_id}] Mode: {mode}")
 
-        # =========================
-        # 🔵 MODO AUDITORIA (SEU ATUAL)
-        # =========================
+        # -------------------------------
+        # 🔵 AUDIT MODE
+        # -------------------------------
         if mode == "audit":
+            job["stage"] = "retrieving_context"
+
             context = get_context(req.query, req.project_id, req.k)
 
-            print("===================================")
-            print("📊 DEBUG TAMANHO")
-            print("Project:", req.project_id)
-            print("Query:", req.query)
-            print("Chunks solicitados (k):", req.k)
-            print("Context size:", len(context))
-            print("Enrichment size:", len(str(req.enrichment)) if req.enrichment else 0)
+            print(f"[SUMMARY][{job_id}] Context size: {len(context)}")
 
-            # ⚠️ (ideal remover depois)
             context = context[:12000]
 
+            job["stage"] = "building_prompt"
             prompt = build_prompt(req.template, context, req.enrichment)
 
-            print("Prompt size:", len(prompt))
-            print("===================================")
+            print(f"[SUMMARY][{job_id}] Prompt size: {len(prompt)}")
 
+            job["stage"] = "llm_call"
             response = llm.invoke(prompt)
 
-            return {
-                "summary": response.content,
-                "project_id": req.project_id
-            }
+            job["result"] = response.content
 
-        # =========================
-        # 🔴 MODO ESTRATÉGICO (NOVO)
-        # =========================
+        # -------------------------------
+        # 🔴 STRATEGIC MODE
+        # -------------------------------
         else:
-            result = run_multi_step_rag(
-                query=req.query,
-                project_id=req.project_id,
-                template=req.template
+            job["stage"] = "multi_step_rag"
+
+            vector_store = get_vector_store(req.project_id)
+
+            docs = vector_store.max_marginal_relevance_search(
+                req.query, k=50, fetch_k=100
             )
 
-            return {
-                "summary": result,
-                "project_id": req.project_id
-            }
+            print(f"[SUMMARY][{job_id}] Docs encontrados: {len(docs)}")
+
+            partial_results = []
+
+            for i, doc in enumerate(docs):
+                print(f"[SUMMARY][{job_id}] Processando doc {i+1}/{len(docs)}")
+
+                prompt = f"""
+                Extraia deste trecho:
+                - inconsistências
+                - valores financeiros
+                - padrões fiscais
+                - evidências
+
+                Texto:
+                {doc.page_content}
+                """
+
+                res = llm.invoke(prompt)
+                partial_results.append(res.content)
+
+            aggregated = "\n\n".join(partial_results)
+
+            print(f"[SUMMARY][{job_id}] Aggregated size: {len(aggregated)}")
+
+            final_prompt = f"""
+            {req.template}
+
+            BASE DE DADOS CONSOLIDADA:
+            {aggregated}
+            """
+
+            job["stage"] = "final_llm"
+
+            final = llm.invoke(final_prompt)
+
+            job["result"] = final.content
+
+        # -------------------------------
+        job["status"] = "completed"
+        job["stage"] = "done"
+
+        print(f"[SUMMARY][{job_id}] ✅ DONE")
 
     except Exception as e:
-        print("🔥 ERRO NO SUMMARY")
+        job["status"] = "error"
+        job["error"] = str(e)
+
+        print(f"[SUMMARY][{job_id}] ❌ ERROR")
         print(traceback.format_exc())
 
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro ao gerar resumo: {str(e)}"
-        )
+# -------------------------------
+# SUMMARY (COM LOGS 🔥)
+# -------------------------------
+@app.post("/generate-summary")
+async def generate_summary(req: SummaryRequest):
+    try:
+        job_id = str(uuid.uuid4())
+
+        summary_jobs[job_id] = {
+            "status": "pending",
+            "stage": "created",
+            "project_id": req.project_id
+        }
+
+        threading.Thread(
+            target=process_summary_job,
+            args=(job_id, req)
+        ).start()
+
+        return {
+            "job_id": job_id,
+            "status": "started"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
