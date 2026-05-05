@@ -113,6 +113,31 @@ def get_vector_store(project_id: str):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro vector store: {str(e)}")
+    
+
+
+    # ===============================
+# MÉTRICAS (ENRICHMENT)
+# ===============================
+def generate_basic_metrics(context: str):
+    lines = context.split("\n")
+
+    metrics = {
+        "registros_c100": 0,
+        "registros_c170": 0,
+        "possiveis_divergencias": 0
+    }
+
+    for line in lines:
+        if "|C100|" in line:
+            metrics["registros_c100"] += 1
+        if "|C170|" in line:
+            metrics["registros_c170"] += 1
+
+    if metrics["registros_c170"] > metrics["registros_c100"] * 5:
+        metrics["possiveis_divergencias"] += 1
+
+    return metrics
 
 # -------------------------------
 # SPLITTER
@@ -136,154 +161,91 @@ llm = ChatOpenAI(
 # -------------------------------
 jobs = {}
 
-# -------------------------------
-# RAG
-# -------------------------------
+# ===============================
+# RAG MELHORADO
+# ===============================
 def get_context(query: str, project_id: str, k: int = 10):
-    try:
-        vector_store = get_vector_store(project_id)
-        docs = vector_store.similarity_search(query, k=k)
+    vector_store = get_vector_store(project_id)
 
-        if not docs:
-            return "Nenhum dado encontrado para este projeto."
+    queries = [
+        query,
+        "divergência C100 C170",
+        "créditos PIS COFINS",
+        "ICMS base cálculo",
+        "NCM CST erro"
+    ]
 
-        context = "\n\n".join([
-            f"[Fonte: {doc.metadata.get('source')} | Chunk: {doc.metadata.get('chunk_index')}]\n{doc.page_content}"
-            for doc in docs
-        ])
+    docs = []
+    for q in queries:
+        docs.extend(vector_store.similarity_search(q, k=k))
 
-        return context
+    # remove duplicados
+    seen = set()
+    unique_docs = []
+    for d in docs:
+        key = d.page_content
+        if key not in seen:
+            seen.add(key)
+            unique_docs.append(d)
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao buscar contexto: {str(e)}")
+    if not unique_docs:
+        return "Sem dados"
 
-# -------------------------------
-# PROMPT
-# -------------------------------
-def build_prompt(template: str, context: str, enrichment: dict | None):
+    return "\n\n".join([
+        f"[{d.metadata.get('source')}] {d.page_content}"
+        for d in unique_docs[:20]
+    ])
 
-    enrichment_text = ""
-    if enrichment:
-        enrichment_text = f"""
-====================
-DADOS DE ENRIQUECIMENTO
-====================
-{enrichment}
-"""
+# ===============================
+# PROMPT EXECUTIVO
+# ===============================
+def build_prompt(context: str, enrichment: dict):
 
-    prompt = f"""
-Você é um auditor fiscal especialista em SPED (EFD PIS/COFINS).
+    return f"""
+Você é um CONSULTOR ESTRATÉGICO TRIBUTÁRIO especializado em SPED.
 
-Sua função é identificar inconsistências reais, validar cálculos e garantir integridade dos dados.
+Gere um RELATÓRIO EXECUTIVO para CEO/CFO.
 
 ====================
 CONTEXTO
 ====================
 {context}
 
-{enrichment_text}
+====================
+DADOS ANALÍTICOS
+====================
+{enrichment}
 
 ====================
 INSTRUÇÕES
 ====================
-{template}
 
-====================
-REGRAS DE AUDITORIA (OBRIGATÓRIAS)
-====================
+O relatório deve conter:
 
-1. NÃO gere descrições genéricas.
-   ❌ Proibido: "volume significativo", "análise necessária"
-   ✅ Obrigatório: achados concretos
+1. SUMÁRIO EXECUTIVO
+2. PRINCIPAIS RISCOS FISCAIS (quantificar)
+3. ACHADOS CONSOLIDADOS
+4. OPORTUNIDADES ESTRATÉGICAS
+5. RECOMENDAÇÕES (curto e médio prazo)
+6. IMPACTO FINANCEIRO (estimado)
+7. CONCLUSÃO
 
-2. Sempre validar consistência entre registros:
-   - A100 (documento) vs A170 (itens)
-   - Totais vs soma dos itens
-   - Valores repetidos ou divergentes
+REGRAS:
+- Sempre quantificar (ex: 10–30 notas)
+- Sempre estimar impacto financeiro
+- Classificar risco: Alto / Médio / Baixo
+- Não ser genérico
 
-3. Verificar:
-   - Base de cálculo
-   - Alíquota aplicada
-   - Valor do tributo
-   - Coerência entre eles
-
-4. Identificar possíveis erros como:
-   - Divergência entre total e itens
-   - Valores duplicados
-   - CST incompatível
-   - Campos zerados indevidamente
-   - Dados inconsistentes entre arquivos
-
-5. Quando NÃO houver erro:
-   - Dizer explicitamente: "Nenhuma inconsistência relevante encontrada"
-
-6. Toda análise deve conter:
-   - Evidência (trecho real)
-   - Explicação técnica
-   - Lógica aplicada
-
-7. Se fizer cálculo:
-   - Mostrar fórmula
-   - Mostrar valores usados
-   - Mostrar resultado
-
-====================
-FORMATO DE RESPOSTA (JSON OBRIGATÓRIO)
-====================
-
-{{
-  "insights": [
-    {{
-      "titulo": "",
-      "explicacao": "",
-      "passo_a_passo": [],
-      "dados_utilizados": [],
-      "logica_aplicada": "",
-      "conclusao": ""
-    }}
-  ],
-  "inconsistencias": [
-    {{
-      "titulo": "",
-      "descricao": "",
-      "impacto": "",
-      "evidencias": [
-        {{
-          "fonte": "",
-          "trecho": ""
-        }}
-      ],
-      "recomendacao": ""
-    }}
-  ],
-  "analises": [],
-  "referencias": []
-}}
-
-====================
-OBJETIVO FINAL
-====================
-
-Gerar um relatório técnico de auditoria, focado em:
-- detectar problemas reais
-- validar integridade dos dados
-- permitir verificação por auditor humano
-
-Se não houver inconsistências, deixe isso claro.
+FORMATO:
+Texto estruturado (estilo consultoria Big4)
 """
 
-    return prompt
-
-# -------------------------------
+# ===============================
 # REQUEST
-# -------------------------------
+# ===============================
 class SummaryRequest(BaseModel):
-    template: str
-    query: Optional[str] = "gerar sumário geral"
-    enrichment: Optional[Dict] = None
-    k: Optional[int] = 5
     project_id: str
-
+    query: Optional[str] = "análise geral"
 # -------------------------------
 # WORKER
 # -------------------------------
@@ -503,37 +465,18 @@ def get_status(job_id: str):
 @app.post("/generate-summary")
 async def generate_summary(req: SummaryRequest):
     try:
-        context = get_context(req.query, req.project_id, req.k)
+        context = get_context(req.query, req.project_id, 5)
 
-        # 🔥 LOGS IMPORTANTES
-        print("===================================")
-        print("📊 DEBUG TAMANHO")
-        print("Project:", req.project_id)
-        print("Query:", req.query)
-        print("Chunks solicitados (k):", req.k)
-        print("Context size:", len(context))
-        print("Enrichment size:", len(str(req.enrichment)) if req.enrichment else 0)
+        metrics = generate_basic_metrics(context)
 
-        # 🔥 LIMITE HARD
-        context = context[:12000]
-
-        prompt = build_prompt(req.template, context, req.enrichment)
-
-        print("Prompt size:", len(prompt))
-        print("===================================")
+        prompt = build_prompt(context, metrics)
 
         response = llm.invoke(prompt)
 
         return {
-            "summary": response.content,
-            "project_id": req.project_id
+            "summary": response.content
         }
 
     except Exception as e:
-        print("🔥 ERRO NO SUMMARY")
         print(traceback.format_exc())
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro ao gerar resumo: {str(e)}"
-        )
+        raise HTTPException(500, str(e))
