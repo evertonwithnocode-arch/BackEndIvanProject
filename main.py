@@ -574,9 +574,9 @@ def process_summary_job(job_id: str, req: SummaryRequest):
         job["mode"] = mode
         print(f"[SUMMARY][{job_id}] Mode: {mode}")
 
-        # -------------------------------
+        # ===============================
         # 🔵 AUDIT MODE
-        # -------------------------------
+        # ===============================
         if mode == "audit":
             job["stage"] = "retrieving_context"
 
@@ -584,6 +584,7 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
             print(f"[SUMMARY][{job_id}] Context size: {len(context)}")
 
+            # 🔥 proteção tamanho
             context = context[:12000]
 
             job["stage"] = "building_prompt"
@@ -596,9 +597,9 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
             job["result"] = response.content
 
-        # -------------------------------
+        # ===============================
         # 🔴 STRATEGIC MODE
-        # -------------------------------
+        # ===============================
         else:
             job["stage"] = "multi_step_rag"
 
@@ -610,39 +611,75 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
             print(f"[SUMMARY][{job_id}] Docs encontrados: {len(docs)}")
 
-            partial_results = [
-            r for r in partial_results
-            if "SEM EVIDÊNCIA" not in r
-            ]
-            print(f"[RAG] docs: {len(docs)}")
-            print(f"[RAG] partial válidos: {len(partial_results)}")
-            print(f"[RAG] aggregated size: {len(aggregated)}")
+            partial_results = []
 
+            # -------------------------------
+            # 🔵 EXTRAÇÃO CONTROLADA
+            # -------------------------------
             for i, doc in enumerate(docs):
                 print(f"[SUMMARY][{job_id}] Processando doc {i+1}/{len(docs)}")
 
                 prompt = f"""
-                Extraia deste trecho:
-                - inconsistências
-                - valores financeiros
-                - padrões fiscais
-                - evidências
+                Extraia APENAS dados REAIS deste trecho.
+
+                OBRIGATÓRIO:
+                - citar registro (ex: C100, A170)
+                - copiar trecho exato
+                - não inventar valores
+
+                Se não houver dado concreto, responda: "SEM EVIDÊNCIA"
 
                 Texto:
                 {doc.page_content}
                 """
 
-                res = llm.invoke(prompt)
-                partial_results.append(res.content)
+                try:
+                    res = llm.invoke(prompt)
+                    content = res.content.strip()
 
+                    # 🔥 filtro anti-lixo
+                    if content and "SEM EVIDÊNCIA" not in content:
+                        partial_results.append(content)
+
+                except Exception as e:
+                    print(f"[SUMMARY][{job_id}] erro doc {i}: {str(e)}")
+
+            # -------------------------------
+            # 🔥 VALIDAÇÃO
+            # -------------------------------
+            print(f"[SUMMARY][{job_id}] válidos: {len(partial_results)}")
+
+            if not partial_results:
+                raise Exception("Nenhuma evidência encontrada nos documentos")
+
+            # -------------------------------
+            # 🔥 AGREGAÇÃO
+            # -------------------------------
             aggregated = "\n\n".join(partial_results)
 
             print(f"[SUMMARY][{job_id}] Aggregated size: {len(aggregated)}")
 
+            # 🔥 proteção contra prompt gigante
+            aggregated = aggregated[:20000]
+
+            # -------------------------------
+            # 🔥 PROMPT FINAL FORTE
+            # -------------------------------
             final_prompt = f"""
             {req.template}
 
-            BASE DE DADOS CONSOLIDADA:
+            REGRAS CRÍTICAS:
+
+            - PROIBIDO inventar valores financeiros
+            - PROIBIDO estimativas sem cálculo
+            - PROIBIDO linguagem genérica
+
+            - Cada afirmação deve conter:
+              - trecho real
+              - origem (arquivo/chunk)
+              - explicação técnica
+
+            BASE DE DADOS:
             {aggregated}
             """
 
