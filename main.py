@@ -584,7 +584,6 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
             print(f"[SUMMARY][{job_id}] Context size: {len(context)}")
 
-            # 🔥 proteção tamanho
             context = context[:12000]
 
             job["stage"] = "building_prompt"
@@ -605,8 +604,11 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
             vector_store = get_vector_store(req.project_id)
 
+            # 🔥 REDUZIDO (menos ruído e menos hallucination)
             docs = vector_store.max_marginal_relevance_search(
-                req.query, k=50, fetch_k=100
+                req.query,
+                k=20,
+                fetch_k=40
             )
 
             print(f"[SUMMARY][{job_id}] Docs encontrados: {len(docs)}")
@@ -614,22 +616,33 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             partial_results = []
 
             # -------------------------------
-            # 🔵 EXTRAÇÃO CONTROLADA
+            # 🔵 EXTRAÇÃO ESTRUTURADA (CRÍTICO)
             # -------------------------------
             for i, doc in enumerate(docs):
-                print(f"[SUMMARY][{job_id}] Processando doc {i+1}/{len(docs)}")
+                print(f"[SUMMARY][{job_id}] Doc {i+1}/{len(docs)}")
 
                 prompt = f"""
-                Extraia APENAS dados REAIS deste trecho.
+                Extraia APENAS dados REAIS do texto.
 
-                OBRIGATÓRIO:
-                - citar registro (ex: C100, A170)
-                - copiar trecho exato
-                - não inventar valores
+                RETORNE JSON:
 
-                Se não houver dado concreto, responda: "SEM EVIDÊNCIA"
+                {{
+                  "evidencias": [
+                    {{
+                      "registro": "",
+                      "trecho": "",
+                      "tipo": "financeiro | inconsistencia | fiscal"
+                    }}
+                  ]
+                }}
 
-                Texto:
+                REGRAS:
+                - NÃO inventar nada
+                - NÃO resumir
+                - NÃO estimar valores
+                - Se não houver evidência → retornar lista vazia
+
+                TEXTO:
                 {doc.page_content}
                 """
 
@@ -637,50 +650,74 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                     res = llm.invoke(prompt)
                     content = res.content.strip()
 
-                    # 🔥 filtro anti-lixo
-                    if content and "SEM EVIDÊNCIA" not in content:
+                    # 🔥 filtro mínimo
+                    if content and "evidencias" in content:
                         partial_results.append(content)
 
                 except Exception as e:
                     print(f"[SUMMARY][{job_id}] erro doc {i}: {str(e)}")
 
             # -------------------------------
-            # 🔥 VALIDAÇÃO
+            # 🔥 VALIDAÇÃO FORTE
             # -------------------------------
             print(f"[SUMMARY][{job_id}] válidos: {len(partial_results)}")
 
             if not partial_results:
-                raise Exception("Nenhuma evidência encontrada nos documentos")
+                raise Exception("Nenhuma evidência encontrada")
+
+            # 🔥 limpa lixo comum
+            filtered_results = [
+                r for r in partial_results
+                if "[]" not in r and "null" not in r.lower()
+            ]
+
+            print(f"[SUMMARY][{job_id}] após filtro: {len(filtered_results)}")
+
+            if not filtered_results:
+                raise Exception("Nenhuma evidência válida após filtro")
 
             # -------------------------------
-            # 🔥 AGREGAÇÃO
+            # 🔥 AGREGAÇÃO CONTROLADA
             # -------------------------------
-            aggregated = "\n\n".join(partial_results)
+            aggregated = "\n\n".join(filtered_results)
 
             print(f"[SUMMARY][{job_id}] Aggregated size: {len(aggregated)}")
 
-            # 🔥 proteção contra prompt gigante
             aggregated = aggregated[:20000]
 
             # -------------------------------
-            # 🔥 PROMPT FINAL FORTE
+            # 🔥 PROMPT FINAL ANTI-HALLUCINATION
             # -------------------------------
             final_prompt = f"""
             {req.template}
 
-            REGRAS CRÍTICAS:
+            ====================
+            BASE DE EVIDÊNCIAS
+            ====================
+            {aggregated}
 
-            - PROIBIDO inventar valores financeiros
-            - PROIBIDO estimativas sem cálculo
+            ====================
+            REGRAS CRÍTICAS
+            ====================
+
+            - PROIBIDO inventar valores
+            - PROIBIDO estimativas
             - PROIBIDO linguagem genérica
 
-            - Cada afirmação deve conter:
+            - TODO número deve ter origem explícita
+
+            - Se não houver dados suficientes:
+              → escrever: "Dado não disponível nos arquivos analisados"
+
+            - Toda análise deve conter:
               - trecho real
-              - origem (arquivo/chunk)
+              - registro (ex: A170, C100)
               - explicação técnica
 
-            BASE DE DADOS:
-            {aggregated}
+            ====================
+            OBJETIVO
+            ====================
+            Gerar relatório executivo baseado SOMENTE nas evidências acima.
             """
 
             job["stage"] = "final_llm"
