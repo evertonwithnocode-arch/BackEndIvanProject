@@ -459,20 +459,49 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                 raise Exception("Nenhuma evidência encontrada")
 
             filtered_results = []
-            for r in partial_results:
+
+            for idx, r in enumerate(partial_results, start=1):
+                print(f"[SUMMARY][{job_id}] FILTER CHECK {idx}")
+
                 match = re.search(r"\{.*\}", r, re.DOTALL)
+
                 if not match:
+                    print(f"[SUMMARY][{job_id}] FILTER {idx}: sem JSON detectado")
+                    print(r[:1000])
                     continue
+
                 try:
                     data = json.loads(match.group(0))
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    print(f"[SUMMARY][{job_id}] FILTER {idx}: JSON inválido: {str(e)}")
+                    print(match.group(0)[:1000])
                     continue
 
                 evidencias = data.get("evidencias") or []
-                valid = [e for e in evidencias if e.get("trecho")]
-                if valid:
-                    data["evidencias"] = valid
+                print(f"[SUMMARY][{job_id}] FILTER {idx}: evidencias={len(evidencias)}")
+
+                valid_evidencias = []
+
+                for e_idx, e in enumerate(evidencias, start=1):
+                    trecho = e.get("trecho")
+                    documento = e.get("documento")
+                    registro = e.get("registro")
+
+                    print(
+                        f"[SUMMARY][{job_id}] FILTER {idx}.{e_idx}: "
+                                    f"documento={documento!r}, registro={registro!r}, "
+                        f"trecho_len={len(str(trecho or ''))}"
+                    )
+
+                    if trecho and str(trecho).strip():
+                        valid_evidencias.append(e)
+
+                print(f"[SUMMARY][{job_id}] FILTER {idx}: valid_evidencias={len(valid_evidencias)}")
+
+                if valid_evidencias:
+                    data["evidencias"] = valid_evidencias
                     filtered_results.append(json.dumps(data, ensure_ascii=False))
+
 
             print(f"[SUMMARY][{job_id}] após filtro: {len(filtered_results)}")
 
