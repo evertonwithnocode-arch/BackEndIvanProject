@@ -502,8 +502,17 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                     continue
 
                 evidencias = data.get("evidencias") or []
+                
                 print(f"[SUMMARY][{job_id}] FILTER {idx}: evidencias={len(evidencias)}")
-
+                if not evidencias:
+                   print(f"[SUMMARY][{job_id}] ⚠️ FILTER {idx}: LLM vazio; usando fallback do chunk SPED")
+                evidencias = [{
+                    "titulo": "Trecho SPED identificado",
+                    "descricao": "O modelo não classificou automaticamente este trecho, mas o conteúdo foi recuperado diretamente dos arquivos SPED e será usado como evidência bruta para a análise.",
+                    "fonte": doc.metadata.get("source", "arquivo_sped"),
+                    "trecho": doc.page_content[:1200],
+                    "tipo": "sped_raw"
+                }]
                 valid_evidencias = []
 
                 for e_idx, e in enumerate(evidencias, start=1):
