@@ -411,10 +411,34 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             job_update(job_id, stage="multi_step_rag")
             vector_store = get_vector_store(req.project_id)
 
+            # ⬇️ OPÇÃO B: na fase de evidências, buscar SOMENTE chunks de documentos (SPED),
+            # ignorando chunks de enriquecimento. Isso evita que os chunks Driva "roubem"
+            # vagas no top-K e façam o LLM retornar evidências vazias.
             docs = vector_store.max_marginal_relevance_search(
-                req.query, k=20, fetch_k=40
+                req.query,
+                k=20,
+                fetch_k=40,
+                filter={"type": "document"},
             )
-            print(f"[SUMMARY][{job_id}] Docs encontrados: {len(docs)}")
+            print(f"[SUMMARY][{job_id}] Docs encontrados (type=document): {len(docs)}")
+
+            # Fallback defensivo: se nenhum chunk tipo 'document' for retornado
+            # (ex.: projetos antigos sem metadata 'type'), refazer busca sem filtro.
+            if not docs:
+                print(f"[SUMMARY][{job_id}] ⚠️ Sem docs com type=document, refazendo sem filtro")
+                docs = vector_store.max_marginal_relevance_search(
+                    req.query, k=20, fetch_k=40
+                )
+                print(f"[SUMMARY][{job_id}] Docs encontrados (sem filtro): {len(docs)}")
+
+            # Log diagnóstico: tipo/fonte de cada doc recuperado
+            for i, doc in enumerate(docs, start=1):
+                src = doc.metadata.get("source", "?")
+                dtype = doc.metadata.get("type", "?")
+                print(
+                    f"[SUMMARY][{job_id}] Doc {i}/{len(docs)} type={dtype} "
+                    f"source={src} len={len(doc.page_content)}"
+                )
 
             partial_results = []
             for i, doc in enumerate(docs):
@@ -489,7 +513,7 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
                     print(
                         f"[SUMMARY][{job_id}] FILTER {idx}.{e_idx}: "
-                                    f"documento={documento!r}, registro={registro!r}, "
+                        f"documento={documento!r}, registro={registro!r}, "
                         f"trecho_len={len(str(trecho or ''))}"
                     )
 
@@ -506,22 +530,33 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             print(f"[SUMMARY][{job_id}] após filtro: {len(filtered_results)}")
 
             if not filtered_results:
-             print(f"[SUMMARY][{job_id}] ⚠️ Nenhuma evidência estruturada encontrada")
-             print(f"[SUMMARY][{job_id}] ⚠️ Usando fallback com respostas brutas")
+                print(f"[SUMMARY][{job_id}] ⚠️ Nenhuma evidência estruturada encontrada")
+                print(f"[SUMMARY][{job_id}] ⚠️ Usando fallback com respostas brutas")
 
-             fallback_results = [
-                 r for r in partial_results
-                 if r and isinstance(r, str) and len(r.strip()) > 20
-             ]
+                fallback_results = [
+                    r for r in partial_results
+                    if r and isinstance(r, str) and len(r.strip()) > 20
+                ]
 
-             if not fallback_results:
-                 raise Exception("Nenhuma resposta útil retornada pelo LLM")
+                if not fallback_results:
+                    raise Exception("Nenhuma resposta útil retornada pelo LLM")
 
-             filtered_results = fallback_results
+                filtered_results = fallback_results
 
             aggregated = "\n\n".join(filtered_results)
             print(f"[SUMMARY][{job_id}] Aggregated size: {len(aggregated)}")
             aggregated = aggregated[:20000]
+
+            # ⬇️ OPÇÃO B (parte 2): injetar enriquecimento APENAS no prompt final,
+            # como contexto cadastral complementar — sem competir com o SPED no retrieval.
+            enrichment_block = ""
+            if req.enrichment:
+                enrichment_block = f"""
+            ====================
+            DADOS DE ENRIQUECIMENTO (CADASTRAL — COMPLEMENTAR)
+            ====================
+            {req.enrichment}
+            """
 
             final_prompt = f"""
             {req.template}
@@ -530,7 +565,7 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             BASE DE EVIDÊNCIAS
             ====================
             {aggregated}
-
+            {enrichment_block}
             ====================
             REGRAS OBRIGATÓRIAS (CRÍTICAS)
             ====================
