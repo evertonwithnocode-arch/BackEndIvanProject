@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_chroma import Chroma
-
+import json, re
 from supabase import create_client
 
 # -------------------------------
@@ -458,9 +458,27 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             if not partial_results:
                 raise Exception("Nenhuma evidência encontrada")
 
-            filtered_results = [
-                r for r in partial_results if "[]" not in r and "null" not in r.lower()
-            ]
+            filtered_results = []
+            for r in partial_results:
+                # extrai o primeiro bloco { ... } caso o LLM tenha vindo com texto antes/depois
+                match = re.search(r"\{.*\}", r, re.DOTALL)
+                if not match:
+                    continue
+                try:
+                    data = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    continue
+
+                evidencias = data.get("evidencias") or []
+                # mantém só evidências com trecho NÃO vazio
+                evidencias = [
+                    e for e in evidencias
+                  if isinstance(e, dict) and (e.get("trecho") or "").strip()
+                ]
+                if evidencias:
+                  filtered_results.append(json.dumps({"evidencias": evidencias}, ensure_ascii=False))            
+
+
             print(f"[SUMMARY][{job_id}] após filtro: {len(filtered_results)}")
 
             if not filtered_results:
