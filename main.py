@@ -174,7 +174,7 @@ text_splitter = RecursiveCharacterTextSplitter(
 # -------------------------------
 # LLM
 # -------------------------------
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, api_key=OPENAI_API_KEY)
+llm = ChatOpenAI(model="gpt-4.1", temperature=0.0, api_key=OPENAI_API_KEY)
 
 # -------------------------------
 # JOBS
