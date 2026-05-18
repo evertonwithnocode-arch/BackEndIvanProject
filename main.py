@@ -33,6 +33,26 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
+def job_create(job_id: str, kind: str, project_id: str, payload: dict | None = None):
+    supabase.table("backend_jobs").insert({
+        "id": job_id,
+        "kind": kind,
+        "project_id": project_id,
+        "status": "pending",
+        "stage": "created",
+        "progress": 0,
+        "payload": payload or {},
+    }).execute()
+
+def job_update(job_id: str, **fields):
+    fields["updated_at"] = "now()"
+    supabase.table("backend_jobs").update(fields).eq("id", job_id).execute()
+
+def job_get(job_id: str):
+    res = supabase.table("backend_jobs").select("*").eq("id", job_id).maybe_single().execute()
+    return res.data
+
+
 BUCKET_NAME = "sped-documents"
 
 
@@ -179,8 +199,7 @@ llm = ChatOpenAI(model="gpt-4.1", temperature=0.0, api_key=OPENAI_API_KEY)
 # -------------------------------
 # JOBS
 # -------------------------------
-jobs = {}
-summary_jobs = {}
+
 
 
 # -------------------------------
@@ -363,15 +382,14 @@ class SummaryRequest(BaseModel):
 # -------------------------------
 def process_job(job_id: str, files_data: List[dict], project_id: str):
     try:
-        job = jobs[job_id]
-        job["status"] = "processing"
+        # Marca como processing no banco
+        job_update(job_id, status="processing", stage="chunking", progress=0)
 
         vector_store = get_vector_store(project_id)
         all_chunks = []
         all_metadata = []
 
         # --- ETAPA 1: CHUNKING ---
-        job["stage"] = "chunking"
         local_splitter = RecursiveCharacterTextSplitter(
             chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
         )
@@ -384,67 +402,64 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
             filename = files_data[i]["filename"]
             for idx, chunk in enumerate(chunks):
                 all_chunks.append(chunk)
-                all_metadata.append(
-                   {
-                       "source": filename,
-                       "chunk_index": idx,
-                       "project_id": project_id,
-                       "type": "document"
-                   }
-               )
+                all_metadata.append({
+                    "source": filename,
+                    "chunk_index": idx,
+                    "project_id": project_id,
+                    "type": "document",
+                })
 
-        job["progress"] = 50
+        job_update(job_id, progress=50, stage="embedding")
 
         # --- ETAPA 2: EMBEDDING COM RETRY E ESPAÇAMENTO ---
-        job["stage"] = "embedding"
-
         BATCH_SIZE = 100
         num_chunks = len(all_chunks)
         num_batches = (num_chunks + BATCH_SIZE - 1) // BATCH_SIZE
 
         def add_batch(batch_idx):
-            # Adicionamos uma lógica de tentativa (retry) para caso a API falhe
             max_retries = 3
             for attempt in range(max_retries):
                 try:
                     start = batch_idx * BATCH_SIZE
                     end = min(start + BATCH_SIZE, num_chunks)
                     vector_store.add_texts(
-                        texts=all_chunks[start:end], metadatas=all_metadata[start:end]
+                        texts=all_chunks[start:end],
+                        metadatas=all_metadata[start:end],
                     )
                     return batch_idx
                 except Exception as e:
                     if "429" in str(e) and attempt < max_retries - 1:
-                        time.sleep(
-                            2 * (attempt + 1)
-                        )  # Espera um pouco mais a cada erro
+                        time.sleep(2 * (attempt + 1))
                         continue
                     raise e
 
-        # Usamos apenas 1 worker para garantir ordem e evitar picos de TPM
-        # No seu Tier atual, a velocidade de 1 worker sequencial com lote de 100
-        # já será muito rápida e segura.
         with ThreadPoolExecutor(max_workers=1) as t_executor:
             futures = []
             for i in range(num_batches):
                 futures.append(t_executor.submit(add_batch, i))
-                # --- O SEGREDO AQUI ---
-                # Pequena pausa de 0.2s entre o disparo de cada lote para suavizar o TPM
-                time.sleep(0.2)
+                time.sleep(0.2)  # suaviza TPM
 
             for idx, future in enumerate(futures):
                 future.result()
-                job["progress"] = 50 + int(((idx + 1) / num_batches) * 50)
+                progress = 50 + int(((idx + 1) / num_batches) * 50)
+                job_update(job_id, progress=progress)
 
-        job["status"] = "completed"
-        job["stage"] = "done"
-        job["progress"] = 100
+        # Finalizado com sucesso
+        job_update(
+            job_id,
+            status="completed",
+            stage="done",
+            progress=100,
+            result={
+                "total_chunks": num_chunks,
+                "total_files": len(files_data),
+            },
+        )
 
     except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
         print(f"Erro Crítico no Job {job_id}:")
         print(traceback.format_exc())
+        job_update(job_id, status="error", error=str(e))
 
 
 def enrichment_to_text(data, parent_key=""):
@@ -627,27 +642,25 @@ def delete_project(project_id: str, folder_path: str):
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
-    job = jobs.get(job_id)
-
+    job = job_get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
-
     return job
+
 
 
 @app.get("/summary-status/{job_id}")
 def get_summary_status(job_id: str):
-    job = summary_jobs.get(job_id)
-
+    job = job_get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Summary job não encontrado")
-
     return job
+
 
 
 def process_summary_job(job_id: str, req: SummaryRequest):
     try:
-        job = summary_jobs[job_id]
+        job_create(job_id, kind="summary", project_id=req.project_id)
 
         job["status"] = "processing"
         job["stage"] = "starting"
