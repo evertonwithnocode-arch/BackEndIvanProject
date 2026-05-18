@@ -506,7 +506,18 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             print(f"[SUMMARY][{job_id}] após filtro: {len(filtered_results)}")
 
             if not filtered_results:
-                raise Exception("Nenhuma evidência válida após filtro")
+             print(f"[SUMMARY][{job_id}] ⚠️ Nenhuma evidência estruturada encontrada")
+             print(f"[SUMMARY][{job_id}] ⚠️ Usando fallback com respostas brutas")
+
+             fallback_results = [
+                 r for r in partial_results
+                 if r and isinstance(r, str) and len(r.strip()) > 20
+             ]
+
+             if not fallback_results:
+                 raise Exception("Nenhuma resposta útil retornada pelo LLM")
+
+             filtered_results = fallback_results
 
             aggregated = "\n\n".join(filtered_results)
             print(f"[SUMMARY][{job_id}] Aggregated size: {len(aggregated)}")
