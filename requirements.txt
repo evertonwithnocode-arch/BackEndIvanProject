@@ -13,3 +13,5 @@ openai
 tiktoken
 
 pydantic
+
+supabase==2.15.3
