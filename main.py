@@ -83,7 +83,7 @@ app.add_middleware(
 # -------------------------------
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 200
-PERSIST_DIR = "/data/chroma_db"
+PERSIST_DIR = "./chroma_db"
 os.makedirs(PERSIST_DIR, exist_ok=True)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
