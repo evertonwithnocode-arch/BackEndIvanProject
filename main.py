@@ -6,66 +6,98 @@ import os
 import uuid
 import threading
 import traceback
+import shutil
+import asyncio
+import time
 from typing import List, Optional, Dict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_chroma import Chroma
-from chromadb import Client
-from chromadb.config import Settings
-import shutil
-import asyncio
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-import math
-import time
-from supabase import create_client
-import json
 
+from supabase import create_client
+
+# -------------------------------
+# SUPABASE
+# -------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # 🔥 usar service role!
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise Exception("Credenciais do Supabase não encontradas")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-def job_create(job_id: str, kind: str, project_id: str, payload: dict | None = None):
-    supabase.table("backend_jobs").insert({
+BUCKET_NAME = "sped-documents"
+
+# -------------------------------
+# JOB PERSISTENCE (backend_jobs)
+# -------------------------------
+JOBS_TABLE = "backend_jobs"
+
+
+def job_create(job_id: str, kind: str, project_id: Optional[str] = None,
+               stage: str = "created") -> None:
+    supabase.table(JOBS_TABLE).insert({
         "id": job_id,
         "kind": kind,
         "project_id": project_id,
         "status": "pending",
-        "stage": "created",
+        "stage": stage,
         "progress": 0,
-        "payload": payload or {},
     }).execute()
 
-def job_update(job_id: str, **fields):
-    fields["updated_at"] = "now()"
-    supabase.table("backend_jobs").update(fields).eq("id", job_id).execute()
 
-def job_get(job_id: str):
-    res = supabase.table("backend_jobs").select("*").eq("id", job_id).maybe_single().execute()
-    return res.data
+def job_update(job_id: str, **fields) -> None:
+    allowed = {"status", "stage", "progress", "result", "error"}
+    payload = {k: v for k, v in fields.items() if k in allowed}
+    if not payload:
+        return
+    try:
+        supabase.table(JOBS_TABLE).update(payload).eq("id", job_id).execute()
+    except Exception as e:
+        print(f"[job_update] erro {job_id}: {e}")
 
 
-BUCKET_NAME = "sped-documents"
+def job_get(job_id: str) -> Optional[dict]:
+    try:
+        res = supabase.table(JOBS_TABLE).select("*").eq("id", job_id).limit(1).execute()
+        if res.data:
+            return res.data[0]
+        return None
+    except Exception as e:
+        print(f"[job_get] erro {job_id}: {e}")
+        return None
 
 
+def job_recover_stuck_on_startup() -> None:
+    try:
+        supabase.table(JOBS_TABLE).update({
+            "status": "error",
+            "error": "Servidor reiniciado durante o processamento. Reenvie a solicitação.",
+        }).in_("status", ["pending", "processing"]).execute()
+    except Exception as e:
+        print(f"[job_recover_stuck_on_startup] {e}")
+
+
+# -------------------------------
+# FASTAPI APP
+# -------------------------------
 app = FastAPI()
 
-from fastapi.responses import Response
 
-from fastapi import Request
+@app.on_event("startup")
+def _on_startup():
+    job_recover_stuck_on_startup()
 
-from fastapi.responses import JSONResponse
 
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
-
 if not INTERNAL_API_KEY:
     raise Exception("INTERNAL_API_KEY não configurada")
 
@@ -81,16 +113,12 @@ async def verify_api_key(request: Request, call_next):
         return await call_next(request)
 
     api_key = request.headers.get("x-api-key")
-
     if api_key != INTERNAL_API_KEY:
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
     return await call_next(request)
 
 
-# -------------------------------
-# CORS
-# -------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -98,6 +126,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # -------------------------------
 # CONFIG
 # -------------------------------
@@ -110,61 +139,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise Exception("OPENAI_API_KEY não encontrada")
 
-# -------------------------------
-# EMBEDDINGS
-# -------------------------------
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
+llm = ChatOpenAI(model="gpt-4.1", temperature=0.0, api_key=OPENAI_API_KEY)
 
-
-def run_multi_step_rag(query, project_id, template):
-    vector_store = get_vector_store(project_id)
-
-    docs = vector_store.max_marginal_relevance_search(
-        query, k=50, fetch_k=100
-    )  # 🔥 aumenta MUITO
-
-    partial_results = []
-
-    for doc in docs:
-        prompt = f"""
-        Extraia deste trecho:
-        - inconsistências
-        - valores financeiros
-        - padrões fiscais
-        - evidências
-        Se não houver dado concreto, responda: "SEM EVIDÊNCIA"
-        Texto:
-        DOCUMENTO: {doc.metadata.get("source")}
-        CHUNK: {doc.metadata.get("chunk_index")}
-
-        TEXTO:
-        {doc.page_content}
-        """
-
-        res = llm.invoke(prompt)
-        partial_results.append(res.content)
-
-    aggregated = "\n\n".join(partial_results)
-
-    final_prompt = f"""
-    {template}
-    REGRAS CRÍTICAS:
-
-    - PROIBIDO inventar valores financeiros
-    - PROIBIDO estimativas sem cálculo explícito
-    - PROIBIDO linguagem genérica
-
-  - Cada insight deve conter:
-    - trecho real
-    - origem (arquivo + chunk)
-    - cálculo demonstrado
-    BASE DE DADOS CONSOLIDADA:
-    {aggregated}
-    """
-
-    final = llm.invoke(final_prompt)
-
-    return final.content
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+)
 
 
 # -------------------------------
@@ -173,62 +153,30 @@ def run_multi_step_rag(query, project_id, template):
 def get_vector_store(project_id: str):
     try:
         project_path = os.path.join(PERSIST_DIR, project_id)
-
         return Chroma(
-            collection_name=f"project_{project_id}",  # 🔥 sempre fixo agora
-            persist_directory=project_path,  # 🔥 pasta por projeto
+            collection_name=f"project_{project_id}",
+            persist_directory=project_path,
             embedding_function=embeddings,
         )
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro vector store: {str(e)}")
 
 
 # -------------------------------
-# SPLITTER
-# -------------------------------
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
-)
-
-# -------------------------------
-# LLM
-# -------------------------------
-llm = ChatOpenAI(model="gpt-4.1", temperature=0.0, api_key=OPENAI_API_KEY)
-
-# -------------------------------
-# JOBS
-# -------------------------------
-
-
-
-# -------------------------------
-# RAG
+# RAG HELPERS
 # -------------------------------
 def get_context(query: str, project_id: str, k: int = 10):
     try:
         vector_store = get_vector_store(project_id)
-
-        docs = vector_store.max_marginal_relevance_search(
-            query,
-            k=k,
-            fetch_k=k * 4
-        )
+        docs = vector_store.max_marginal_relevance_search(query, k=k, fetch_k=k * 4)
 
         if not docs:
             return "Nenhum dado encontrado para este projeto."
 
         context_parts = []
-
         for doc in docs:
-
             doc_type = doc.metadata.get("type", "document")
-
-            if doc_type == "enrichment":
-                prefix = "[ENRICHMENT]"
-            else:
-                prefix = "[DOCUMENTO]"
-
+            prefix = "[ENRICHMENT]" if doc_type == "enrichment" else "[DOCUMENTO]"
             context_parts.append(
                 f"""
 {prefix}
@@ -238,20 +186,12 @@ Chunk: {doc.metadata.get("chunk_index")}
 {doc.page_content}
 """
             )
-
         return "\n\n".join(context_parts)
-
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro ao buscar contexto: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar contexto: {str(e)}")
 
-# -------------------------------
-# PROMPT
-# -------------------------------
+
 def build_prompt(template: str, context: str, enrichment: dict | None):
-
     enrichment_text = ""
     if enrichment:
         enrichment_text = f"""
@@ -261,7 +201,7 @@ DADOS DE ENRIQUECIMENTO
 {enrichment}
 """
 
-    prompt = f"""
+    return f"""
 Você é um auditor fiscal especialista em SPED (EFD PIS/COFINS).
 
 Sua função é identificar inconsistências reais, validar cálculos e garantir integridade dos dados.
@@ -291,36 +231,15 @@ REGRAS DE AUDITORIA (OBRIGATÓRIAS)
    - Totais vs soma dos itens
    - Valores repetidos ou divergentes
 
-3. Verificar:
-   - Base de cálculo
-   - Alíquota aplicada
-   - Valor do tributo
-   - Coerência entre eles
+3. Verificar base de cálculo, alíquota, valor do tributo e coerência entre eles.
 
-4. Identificar possíveis erros como:
-   - Divergência entre total e itens
-   - Valores duplicados
-   - CST incompatível
-   - Campos zerados indevidamente
-   - Dados inconsistentes entre arquivos
+4. Identificar erros como divergência total/itens, valores duplicados, CST incompatível, campos zerados.
 
-5. Quando NÃO houver erro:
-   - Dizer explicitamente: "Nenhuma inconsistência relevante encontrada"
+5. Quando NÃO houver erro: dizer "Nenhuma inconsistência relevante encontrada".
 
-6. Toda análise deve conter:
-   - Evidência (trecho real)
-   - Explicação técnica
-   - Lógica aplicada
+6. Toda análise deve conter evidência (trecho real), explicação técnica e lógica aplicada.
 
-7. Se fizer cálculo:
-   - Mostrar fórmula
-   - Mostrar valores usados
-   - Mostrar resultado
-
-====================
-Se o usuário pedir estrutura → respeite
-Senão → liberdade total
-====================
+7. Se fizer cálculo: mostrar fórmula, valores usados e resultado.
 
 {{
   "insights": [
@@ -350,24 +269,11 @@ Senão → liberdade total
   "analises": [],
   "referencias": []
 }}
-
-====================
-OBJETIVO FINAL
-====================
-
-Gerar um relatório técnico de auditoria, focado em:
-- detectar problemas reais
-- validar integridade dos dados
-- permitir verificação por auditor humano
-
-Se não houver inconsistências, deixe isso claro.
 """
-
-    return prompt
 
 
 # -------------------------------
-# REQUEST
+# MODELS
 # -------------------------------
 class SummaryRequest(BaseModel):
     template: str
@@ -377,19 +283,23 @@ class SummaryRequest(BaseModel):
     project_id: str
 
 
+class EnrichmentRequest(BaseModel):
+    project_id: str
+    enrichment: Dict
+    source: Optional[str] = "manual_enrichment"
+
+
 # -------------------------------
-# WORKER
+# PROCESS JOB (chunking + embedding)
 # -------------------------------
 def process_job(job_id: str, files_data: List[dict], project_id: str):
     try:
-        # Marca como processing no banco
         job_update(job_id, status="processing", stage="chunking", progress=0)
 
         vector_store = get_vector_store(project_id)
         all_chunks = []
         all_metadata = []
 
-        # --- ETAPA 1: CHUNKING ---
         local_splitter = RecursiveCharacterTextSplitter(
             chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
         )
@@ -411,7 +321,6 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
 
         job_update(job_id, progress=50, stage="embedding")
 
-        # --- ETAPA 2: EMBEDDING COM RETRY E ESPAÇAMENTO ---
         BATCH_SIZE = 100
         num_chunks = len(all_chunks)
         num_batches = (num_chunks + BATCH_SIZE - 1) // BATCH_SIZE
@@ -437,14 +346,13 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
             futures = []
             for i in range(num_batches):
                 futures.append(t_executor.submit(add_batch, i))
-                time.sleep(0.2)  # suaviza TPM
+                time.sleep(0.2)
 
             for idx, future in enumerate(futures):
                 future.result()
                 progress = 50 + int(((idx + 1) / num_batches) * 50)
                 job_update(job_id, progress=progress)
 
-        # Finalizado com sucesso
         job_update(
             job_id,
             status="completed",
@@ -462,266 +370,55 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
         job_update(job_id, status="error", error=str(e))
 
 
-def enrichment_to_text(data, parent_key=""):
-    texts = []
-
-    if isinstance(data, dict):
-        for key, value in data.items():
-            new_key = f"{parent_key}.{key}" if parent_key else key
-            texts.append(enrichment_to_text(value, new_key))
-
-    elif isinstance(data, list):
-        for idx, item in enumerate(data):
-            texts.append(enrichment_to_text(item, f"{parent_key}[{idx}]"))
-
-    else:
-        texts.append(f"{parent_key}: {data}")
-
-    return "\n".join(texts)
-
-class EnrichmentRequest(BaseModel):
-    project_id: str
-    enrichment: Dict
-    source: Optional[str] = "manual_enrichment"
-
-@app.post("/enrichment")
-async def upload_enrichment(req: EnrichmentRequest):
-    try:
-        vector_store = get_vector_store(req.project_id)
-
-        # -------------------------
-        # SERIALIZA JSON
-        # -------------------------
-        enrichment_text = enrichment_to_text(req.enrichment)
-
-        # -------------------------
-        # CHUNKING
-        # -------------------------
-        chunks = text_splitter.split_text(enrichment_text)
-
-        texts = []
-        metadatas = []
-
-        for idx, chunk in enumerate(chunks):
-            texts.append(chunk)
-
-            metadatas.append({
-                "project_id": req.project_id,
-                "type": "enrichment",
-                "source": req.source,
-                "chunk_index": idx
-            })
-
-        # -------------------------
-        # EMBEDDING + SAVE
-        # -------------------------
-        vector_store.add_texts(
-            texts=texts,
-            metadatas=metadatas
-        )
-
-        return {
-            "status": "success",
-            "chunks_saved": len(chunks)
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 # -------------------------------
-# UPLOAD
+# PROCESS SUMMARY JOB
 # -------------------------------
-@app.post("/upload")
-async def upload_documents(project_id: str, files: List[UploadFile] = File(...)):
-    try:
-        if not project_id:
-            raise HTTPException(status_code=400, detail="project_id obrigatório")
-
-        job_id = str(uuid.uuid4())
-
-        # Função auxiliar para processar cada arquivo individualmente de forma assíncrona
-        async def process_single_file(file: UploadFile):
-            # Leitura assíncrona do conteúdo
-            content = await file.read()
-            # Decodificação (aqui você já ganha tempo processando enquanto outros leem)
-            text = content.decode("utf-8", errors="ignore")
-
-            if text.strip():
-                return {"filename": file.filename, "text": text}
-            return None
-
-        # --- O PONTO CHAVE: Upload Paralelo e Assíncrono ---
-        # asyncio.gather dispara todas as corrotinas ao mesmo tempo
-        # Em vez de esperar arquivo por arquivo, o Python gerencia o I/O de todos simultaneamente
-        results = await asyncio.gather(*[process_single_file(f) for f in files])
-
-        # Filtra arquivos que retornaram None (vazios)
-        files_data = [res for res in results if res is not None]
-
-        if not files_data:
-            raise HTTPException(status_code=400, detail="Nenhum arquivo válido")
-
-        # Registro do Job
-        jobs[job_id] = {
-            "status": "pending",
-            "progress": 0,
-            "stage": "upload",
-            "project_id": project_id,
-        }
-
-        # Inicia o processamento pesado (Chunking/Embedding) em uma thread separada
-        # para não bloquear a resposta do endpoint
-        threading.Thread(
-            target=process_job, args=(job_id, files_data, project_id)
-        ).start()
-
-        return {"job_id": job_id, "project_id": project_id}
-
-    except Exception as e:
-        # Se algo falhar no gather ou no processamento inicial
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# -------------------------------
-# STATUS
-# -------------------------------
-
-
-@app.delete("/delete-project/{project_id}")
-def delete_project(project_id: str, folder_path: str):
-    try:
-        if not project_id:
-            raise HTTPException(status_code=400, detail="project_id obrigatório")
-
-        if not folder_path:
-            raise HTTPException(status_code=400, detail="folder_path obrigatório")
-
-        # -------------------------------
-        # 🔥 1. DELETAR STORAGE (LOOP)
-        # -------------------------------
-        try:
-            while True:
-                files = supabase.storage.from_(BUCKET_NAME).list(path=folder_path)
-
-                if not files:
-                    break  # acabou tudo
-
-                paths = [f"{folder_path.rstrip('/')}/{file['name']}" for file in files]
-
-                supabase.storage.from_(BUCKET_NAME).remove(paths)
-
-                print(f"🗑️ Deletados {len(paths)} arquivos...")
-
-                # 🔥 pequena pausa pra evitar rate limit
-                time.sleep(0.2)
-
-        except Exception as e:
-            print("⚠️ Erro ao deletar storage:", str(e))
-
-        # -------------------------------
-        # 🔥 2. DELETAR CHROMA
-        # -------------------------------
-        project_path = os.path.join(PERSIST_DIR, project_id)
-
-        if os.path.exists(project_path):
-            shutil.rmtree(project_path)
-
-        return {
-            "status": "success",
-            "message": f"Project {project_id} + folder {folder_path} deletados completamente",
-        }
-
-    except Exception as e:
-        print("🔥 ERRO AO DELETAR PROJECT")
-        print(traceback.format_exc())
-
-        raise HTTPException(
-            status_code=500, detail=f"Erro ao deletar projeto: {str(e)}"
-        )
-
-
-@app.get("/status/{job_id}")
-def get_status(job_id: str):
-    job = job_get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job não encontrado")
-    return job
-
-
-
-@app.get("/summary-status/{job_id}")
-def get_summary_status(job_id: str):
-    job = job_get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Summary job não encontrado")
-    return job
-
-
-
 def process_summary_job(job_id: str, req: SummaryRequest):
     try:
-        job_create(job_id, kind="summary", project_id=req.project_id)
-
-        job["status"] = "processing"
-        job["stage"] = "starting"
+        job_update(job_id, status="processing", stage="starting")
         print(f"[SUMMARY][{job_id}] 🚀 START")
 
-        # -------------------------------
-        # 🔥 DETECT MODE
-        # -------------------------------
-        if "DOCUMENTO 1" in req.template:
-            mode = "strategic"
-        else:
-            mode = "audit"
-
-        job["mode"] = mode
+        mode = "strategic" if "DOCUMENTO 1" in req.template else "audit"
         print(f"[SUMMARY][{job_id}] Mode: {mode}")
 
         # ===============================
         # 🔵 AUDIT MODE
         # ===============================
         if mode == "audit":
-            job["stage"] = "retrieving_context"
-
+            job_update(job_id, stage="retrieving_context")
             context = get_context(req.query, req.project_id, req.k)
-
             print(f"[SUMMARY][{job_id}] Context size: {len(context)}")
-
             context = context[:12000]
 
-            job["stage"] = "building_prompt"
+            job_update(job_id, stage="building_prompt")
             prompt = build_prompt(req.template, context, req.enrichment)
-
             print(f"[SUMMARY][{job_id}] Prompt size: {len(prompt)}")
 
-            job["stage"] = "llm_call"
+            job_update(job_id, stage="llm_call")
             response = llm.invoke(prompt)
 
-            job["result"] = response.content
+            job_update(
+                job_id,
+                status="completed",
+                stage="done",
+                result={"mode": mode, "content": response.content},
+            )
 
         # ===============================
         # 🔴 STRATEGIC MODE
         # ===============================
         else:
-            job["stage"] = "multi_step_rag"
-
+            job_update(job_id, stage="multi_step_rag")
             vector_store = get_vector_store(req.project_id)
 
-            # 🔥 REDUZIDO (menos ruído e menos hallucination)
             docs = vector_store.max_marginal_relevance_search(
                 req.query, k=20, fetch_k=40
             )
-
             print(f"[SUMMARY][{job_id}] Docs encontrados: {len(docs)}")
 
             partial_results = []
-
-            # -------------------------------
-            # 🔵 EXTRAÇÃO ESTRUTURADA (CRÍTICO)
-            # -------------------------------
             for i, doc in enumerate(docs):
                 print(f"[SUMMARY][{job_id}] Doc {i+1}/{len(docs)}")
-
                 prompt = f"""
                 Extraia APENAS dados REAIS do texto.
 
@@ -752,44 +449,27 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                 try:
                     res = llm.invoke(prompt)
                     content = res.content.strip()
-
-                    # 🔥 filtro mínimo
                     if content and "evidencias" in content:
                         partial_results.append(content)
-
                 except Exception as e:
                     print(f"[SUMMARY][{job_id}] erro doc {i}: {str(e)}")
 
-            # -------------------------------
-            # 🔥 VALIDAÇÃO FORTE
-            # -------------------------------
             print(f"[SUMMARY][{job_id}] válidos: {len(partial_results)}")
-
             if not partial_results:
                 raise Exception("Nenhuma evidência encontrada")
 
-            # 🔥 limpa lixo comum
             filtered_results = [
                 r for r in partial_results if "[]" not in r and "null" not in r.lower()
             ]
-
             print(f"[SUMMARY][{job_id}] após filtro: {len(filtered_results)}")
 
             if not filtered_results:
                 raise Exception("Nenhuma evidência válida após filtro")
 
-            # -------------------------------
-            # 🔥 AGREGAÇÃO CONTROLADA
-            # -------------------------------
             aggregated = "\n\n".join(filtered_results)
-
             print(f"[SUMMARY][{job_id}] Aggregated size: {len(aggregated)}")
-
             aggregated = aggregated[:20000]
 
-            # -------------------------------
-            # 🔥 PROMPT FINAL ANTI-HALLUCINATION
-            # -------------------------------
             final_prompt = f"""
             {req.template}
 
@@ -804,12 +484,6 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
             1. TODA informação deve citar origem EXPLÍCITA
 
-            Formato obrigatório:
-
-            "FORMATO OBRIGATÓRIO:
-
-            Toda afirmação deve seguir exatamente:
-
             "Dado identificado no documento: [NOME]
             Trecho:
             [COLAR TRECHO ORIGINAL]
@@ -820,64 +494,164 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             Resultado:
             [valor ou inconsistência]"
 
-            Se não seguir esse formato → resposta inválida"
-
-            2. PROIBIDO:
-            - inventar valores
-            - estimar números
-            - generalizar sem evidência
-
-            3. TODO dado deve conter:
-            - documento de origem
-            - trecho literal
-            - explicação técnica
-
-            4. Se não houver evidência suficiente:
-            → escrever exatamente:
-            "Dado não disponível nos arquivos analisados"
-
-            5. NÃO produzir nenhuma afirmação sem citação
-
-            ====================
-            OBJETIVO
-            ====================
-            Gerar relatório executivo 100% rastreável.
+            2. PROIBIDO inventar valores, estimar números, generalizar sem evidência.
+            3. TODO dado deve conter documento de origem, trecho literal e explicação técnica.
+            4. Se não houver evidência suficiente → "Dado não disponível nos arquivos analisados"
+            5. NÃO produzir nenhuma afirmação sem citação.
             """
 
-            job["stage"] = "final_llm"
-
+            job_update(job_id, stage="final_llm")
             final = llm.invoke(final_prompt)
 
-            job["result"] = final.content
-
-        # -------------------------------
-        job["status"] = "completed"
-        job["stage"] = "done"
+            job_update(
+                job_id,
+                status="completed",
+                stage="done",
+                result={"mode": mode, "content": final.content},
+            )
 
         print(f"[SUMMARY][{job_id}] ✅ DONE")
 
     except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
-
         print(f"[SUMMARY][{job_id}] ❌ ERROR")
         print(traceback.format_exc())
+        job_update(job_id, status="error", error=str(e))
 
 
 # -------------------------------
-# SUMMARY (COM LOGS 🔥)
+# ENDPOINTS
 # -------------------------------
+@app.post("/enrichment")
+async def upload_enrichment(req: EnrichmentRequest):
+    try:
+        vector_store = get_vector_store(req.project_id)
+        enrichment_text = enrichment_to_text(req.enrichment)
+        chunks = text_splitter.split_text(enrichment_text)
+
+        texts, metadatas = [], []
+        for idx, chunk in enumerate(chunks):
+            texts.append(chunk)
+            metadatas.append({
+                "project_id": req.project_id,
+                "type": "enrichment",
+                "source": req.source,
+                "chunk_index": idx,
+            })
+
+        vector_store.add_texts(texts=texts, metadatas=metadatas)
+        return {"status": "success", "chunks_saved": len(chunks)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def enrichment_to_text(data, parent_key=""):
+    texts = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            new_key = f"{parent_key}.{key}" if parent_key else key
+            texts.append(enrichment_to_text(value, new_key))
+    elif isinstance(data, list):
+        for idx, item in enumerate(data):
+            texts.append(enrichment_to_text(item, f"{parent_key}[{idx}]"))
+    else:
+        texts.append(f"{parent_key}: {data}")
+    return "\n".join(texts)
+
+
+@app.post("/upload")
+async def upload_documents(project_id: str, files: List[UploadFile] = File(...)):
+    try:
+        if not project_id:
+            raise HTTPException(status_code=400, detail="project_id obrigatório")
+
+        job_id = str(uuid.uuid4())
+
+        async def process_single_file(file: UploadFile):
+            content = await file.read()
+            text = content.decode("utf-8", errors="ignore")
+            if text.strip():
+                return {"filename": file.filename, "text": text}
+            return None
+
+        results = await asyncio.gather(*[process_single_file(f) for f in files])
+        files_data = [res for res in results if res is not None]
+
+        if not files_data:
+            raise HTTPException(status_code=400, detail="Nenhum arquivo válido")
+
+        # Persiste o job no Supabase
+        job_create(job_id, kind="process", project_id=project_id)
+
+        # Dispara worker em background
+        threading.Thread(
+            target=process_job, args=(job_id, files_data, project_id)
+        ).start()
+
+        return {"job_id": job_id, "project_id": project_id}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/delete-project/{project_id}")
+def delete_project(project_id: str, folder_path: str):
+    try:
+        if not project_id:
+            raise HTTPException(status_code=400, detail="project_id obrigatório")
+        if not folder_path:
+            raise HTTPException(status_code=400, detail="folder_path obrigatório")
+
+        try:
+            while True:
+                files = supabase.storage.from_(BUCKET_NAME).list(path=folder_path)
+                if not files:
+                    break
+                paths = [f"{folder_path.rstrip('/')}/{file['name']}" for file in files]
+                supabase.storage.from_(BUCKET_NAME).remove(paths)
+                print(f"🗑️ Deletados {len(paths)} arquivos...")
+                time.sleep(0.2)
+        except Exception as e:
+            print("⚠️ Erro ao deletar storage:", str(e))
+
+        project_path = os.path.join(PERSIST_DIR, project_id)
+        if os.path.exists(project_path):
+            shutil.rmtree(project_path)
+
+        return {
+            "status": "success",
+            "message": f"Project {project_id} + folder {folder_path} deletados completamente",
+        }
+    except Exception as e:
+        print("🔥 ERRO AO DELETAR PROJECT")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Erro ao deletar projeto: {str(e)}")
+
+
+@app.get("/status/{job_id}")
+def get_status(job_id: str):
+    job = job_get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+    return job
+
+
+@app.get("/summary-status/{job_id}")
+def get_summary_status(job_id: str):
+    job = job_get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Summary job não encontrado")
+    return job
+
+
 @app.post("/generate-summary")
 async def generate_summary(req: SummaryRequest):
     try:
         job_id = str(uuid.uuid4())
 
-        summary_jobs[job_id] = {
-            "status": "pending",
-            "stage": "created",
-            "project_id": req.project_id,
-        }
+        # Persiste o job no Supabase
+        job_create(job_id, kind="summary", project_id=req.project_id)
 
+        # Dispara worker em background
         threading.Thread(target=process_summary_job, args=(job_id, req)).start()
 
         return {"job_id": job_id, "status": "started"}
