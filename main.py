@@ -23,6 +23,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import math
 import time
 from supabase import create_client
+import json
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # 🔥 usar service role!
@@ -154,7 +155,7 @@ def get_vector_store(project_id: str):
         project_path = os.path.join(PERSIST_DIR, project_id)
 
         return Chroma(
-            collection_name="default",  # 🔥 sempre fixo agora
+            collection_name=f"project_{project_id}",  # 🔥 sempre fixo agora
             persist_directory=project_path,  # 🔥 pasta por projeto
             embedding_function=embeddings,
         )
@@ -188,25 +189,44 @@ summary_jobs = {}
 def get_context(query: str, project_id: str, k: int = 10):
     try:
         vector_store = get_vector_store(project_id)
-        docs = vector_store.similarity_search(query, k=k)
+
+        docs = vector_store.max_marginal_relevance_search(
+            query,
+            k=k,
+            fetch_k=k * 4
+        )
 
         if not docs:
             return "Nenhum dado encontrado para este projeto."
 
-        context = "\n\n".join(
-            [
-                f"[Fonte: {doc.metadata.get('source')} | Chunk: {doc.metadata.get('chunk_index')}]\n{doc.page_content}"
-                for doc in docs
-            ]
-        )
+        context_parts = []
 
-        return context
+        for doc in docs:
+
+            doc_type = doc.metadata.get("type", "document")
+
+            if doc_type == "enrichment":
+                prefix = "[ENRICHMENT]"
+            else:
+                prefix = "[DOCUMENTO]"
+
+            context_parts.append(
+                f"""
+{prefix}
+Fonte: {doc.metadata.get("source")}
+Chunk: {doc.metadata.get("chunk_index")}
+
+{doc.page_content}
+"""
+            )
+
+        return "\n\n".join(context_parts)
 
     except Exception as e:
         raise HTTPException(
-            status_code=500, detail=f"Erro ao buscar contexto: {str(e)}"
+            status_code=500,
+            detail=f"Erro ao buscar contexto: {str(e)}"
         )
-
 
 # -------------------------------
 # PROMPT
@@ -365,8 +385,13 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
             for idx, chunk in enumerate(chunks):
                 all_chunks.append(chunk)
                 all_metadata.append(
-                    {"source": filename, "chunk_index": idx, "project_id": project_id}
-                )
+                   {
+                       "source": filename,
+                       "chunk_index": idx,
+                       "project_id": project_id,
+                       "type": "document"
+                   }
+               )
 
         job["progress"] = 50
 
@@ -421,6 +446,72 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
         print(f"Erro Crítico no Job {job_id}:")
         print(traceback.format_exc())
 
+
+def enrichment_to_text(data, parent_key=""):
+    texts = []
+
+    if isinstance(data, dict):
+        for key, value in data.items():
+            new_key = f"{parent_key}.{key}" if parent_key else key
+            texts.append(enrichment_to_text(value, new_key))
+
+    elif isinstance(data, list):
+        for idx, item in enumerate(data):
+            texts.append(enrichment_to_text(item, f"{parent_key}[{idx}]"))
+
+    else:
+        texts.append(f"{parent_key}: {data}")
+
+    return "\n".join(texts)
+
+class EnrichmentRequest(BaseModel):
+    project_id: str
+    enrichment: Dict
+    source: Optional[str] = "manual_enrichment"
+
+@app.post("/enrichment")
+async def upload_enrichment(req: EnrichmentRequest):
+    try:
+        vector_store = get_vector_store(req.project_id)
+
+        # -------------------------
+        # SERIALIZA JSON
+        # -------------------------
+        enrichment_text = enrichment_to_text(req.enrichment)
+
+        # -------------------------
+        # CHUNKING
+        # -------------------------
+        chunks = text_splitter.split_text(enrichment_text)
+
+        texts = []
+        metadatas = []
+
+        for idx, chunk in enumerate(chunks):
+            texts.append(chunk)
+
+            metadatas.append({
+                "project_id": req.project_id,
+                "type": "enrichment",
+                "source": req.source,
+                "chunk_index": idx
+            })
+
+        # -------------------------
+        # EMBEDDING + SAVE
+        # -------------------------
+        vector_store.add_texts(
+            texts=texts,
+            metadatas=metadatas
+        )
+
+        return {
+            "status": "success",
+            "chunks_saved": len(chunks)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------------
 # UPLOAD
