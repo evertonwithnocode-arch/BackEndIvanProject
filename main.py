@@ -460,7 +460,6 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
             filtered_results = []
             for r in partial_results:
-                # extrai o primeiro bloco { ... } caso o LLM tenha vindo com texto antes/depois
                 match = re.search(r"\{.*\}", r, re.DOTALL)
                 if not match:
                     continue
@@ -470,14 +469,10 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                     continue
 
                 evidencias = data.get("evidencias") or []
-                # mantém só evidências com trecho NÃO vazio
-                evidencias = [
-                    e for e in evidencias
-                  if isinstance(e, dict) and (e.get("trecho") or "").strip()
-                ]
-                if evidencias:
-                  filtered_results.append(json.dumps({"evidencias": evidencias}, ensure_ascii=False))            
-
+                valid = [e for e in evidencias if e.get("trecho")]
+                if valid:
+                    data["evidencias"] = valid
+                    filtered_results.append(json.dumps(data, ensure_ascii=False))
 
             print(f"[SUMMARY][{job_id}] após filtro: {len(filtered_results)}")
 
