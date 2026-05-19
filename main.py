@@ -132,7 +132,7 @@ app.add_middleware(
 # -------------------------------
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 200
-PERSIST_DIR = "./chroma_db"
+PERSIST_DIR = "/data/chroma_db"
 os.makedirs(PERSIST_DIR, exist_ok=True)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -140,7 +140,7 @@ if not OPENAI_API_KEY:
     raise Exception("OPENAI_API_KEY não encontrada")
 
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
-llm = ChatOpenAI(model="gpt-4.1", temperature=0.0, api_key=OPENAI_API_KEY)
+llm = ChatOpenAI(model="gpt-5", temperature=0.0, api_key=OPENAI_API_KEY)
 
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
