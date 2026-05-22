@@ -1,5 +1,4 @@
 from dotenv import load_dotenv
-
 load_dotenv()
 
 import os
@@ -19,10 +18,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain_chroma import Chroma
+from langchain_core.embeddings import Embeddings
 import json, re
 from supabase import create_client
+from openai import OpenAI
 
 # -------------------------------
 # SUPABASE
@@ -118,7 +119,7 @@ app.add_middleware(
 # CONFIG
 # -------------------------------
 CHUNK_SIZE = 1500
-CHUNK_OVERLAP = 200
+CHUNK_OVERLAP = 150          # ⚡ menor overlap = menos chunks
 PERSIST_DIR = "/data/chroma_db"
 os.makedirs(PERSIST_DIR, exist_ok=True)
 
@@ -126,7 +127,37 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise Exception("OPENAI_API_KEY não encontrada")
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
+# ⚡ Cliente OpenAI nativo p/ batch de embeddings (até 2048 inputs por request)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+EMBED_MODEL = "text-embedding-3-small"
+EMBED_BATCH = 256
+
+
+class BatchOpenAIEmbeddings(Embeddings):
+    """Embeddings em lote (256 textos por request) — ~10x mais rápido."""
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        out: List[List[float]] = []
+        for i in range(0, len(texts), EMBED_BATCH):
+            batch = texts[i:i + EMBED_BATCH]
+            for attempt in range(4):
+                try:
+                    resp = openai_client.embeddings.create(model=EMBED_MODEL, input=batch)
+                    out.extend([d.embedding for d in resp.data])
+                    break
+                except Exception as e:
+                    msg = str(e)
+                    if ("429" in msg or "rate" in msg.lower()) and attempt < 3:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise
+        return out
+
+    def embed_query(self, text: str) -> List[float]:
+        resp = openai_client.embeddings.create(model=EMBED_MODEL, input=[text])
+        return resp.data[0].embedding
+
+
+embeddings = BatchOpenAIEmbeddings()
 llm = ChatOpenAI(model="gpt-5", temperature=0.0, api_key=OPENAI_API_KEY)
 
 text_splitter = RecursiveCharacterTextSplitter(
@@ -149,16 +180,16 @@ def get_vector_store(project_id: str):
         raise HTTPException(status_code=500, detail=f"Erro vector store: {str(e)}")
 
 
-# >>> ALTERAÇÃO #2: detector de registro SPED a partir do texto do chunk.
-# Identifica blocos no início da linha (|0450|, |C170|, |M200|, etc.)
+# -------------------------------
+# SPED helpers
+# -------------------------------
 SPED_REGISTRO_REGEX = re.compile(r"^\|([0-9A-Z]{4})\|", re.MULTILINE)
 
+
 def detect_registros(text: str) -> List[str]:
-    """Retorna lista única de registros SPED encontrados no chunk (ex.: ['0450','C170'])."""
     if not text:
         return []
     found = SPED_REGISTRO_REGEX.findall(text)
-    # preserva ordem mas remove duplicados
     seen, out = set(), []
     for r in found:
         if r not in seen:
@@ -168,7 +199,6 @@ def detect_registros(text: str) -> List[str]:
 
 
 def primary_registro(text: str) -> Optional[str]:
-    """Registro 'dominante' do chunk (o que mais aparece)."""
     if not text:
         return None
     matches = SPED_REGISTRO_REGEX.findall(text)
@@ -177,20 +207,16 @@ def primary_registro(text: str) -> Optional[str]:
     return Counter(matches).most_common(1)[0][0]
 
 
-# >>> ALTERAÇÃO #1: limite máximo de chunks 0450 no contexto final
 MAX_0450_CHUNKS = 2
 
 
 def cap_registro_chunks(docs, registro: str, max_keep: int):
-    """Mantém no máximo `max_keep` chunks cujo registro primário == registro."""
-    kept, dropped = [], 0
-    count = 0
+    kept, dropped, count = [], 0, 0
     for d in docs:
         reg = d.metadata.get("registro") or primary_registro(d.page_content)
         if reg == registro:
             if count < max_keep:
-                kept.append(d)
-                count += 1
+                kept.append(d); count += 1
             else:
                 dropped += 1
         else:
@@ -209,7 +235,6 @@ def get_context(query: str, project_id: str, k: int = 10):
         if not docs:
             return "Nenhum dado encontrado para este projeto."
 
-        # >>> ALTERAÇÃO #1 (audit mode): aplicar cap em 0450 também aqui
         docs, dropped = cap_registro_chunks(docs, "0450", MAX_0450_CHUNKS)
         if dropped:
             print(f"[get_context] descartados {dropped} chunks 0450 acima do limite")
@@ -272,15 +297,12 @@ REGRAS DE AUDITORIA (OBRIGATÓRIAS)
 5. Quando NÃO houver erro: "Nenhuma inconsistência relevante encontrada".
 6. Toda análise deve conter evidência (trecho real), explicação técnica e lógica aplicada.
 7. Se fizer cálculo: mostrar fórmula, valores usados e resultado.
-
-# >>> ALTERAÇÃO #4: regras de formatação obrigatórias do output
-8. NÃO use o registro 0450 (informações complementares) como evidência principal de análise
-   financeira. Ele é apenas dicionário de observações — priorize blocos com valores:
-   M100, M200, M500, M600 (apuração) e C100, C170, C190, C500, D100 (documentos/itens).
+8. NÃO use o registro 0450 como evidência principal de análise financeira.
+   Priorize blocos com valores: M100, M200, M500, M600 (apuração) e C100, C170, C190, C500, D100.
 9. Ao numerar seções, substitua qualquer placeholder `X.N` pelo número real do capítulo.
    NUNCA escreva `X.` literal no texto final (ex.: use "4.3" e não "X.3" ou ".3").
-10. Se um item realmente não tiver dado nos arquivos analisados, escreva
-    "Dado não disponível nos arquivos analisados" SOMENTE uma vez por seção — não duplique.
+10. Se um item realmente não tiver dado, escreva "Dado não disponível nos arquivos analisados"
+    SOMENTE uma vez por seção — não duplique.
 
 {{
   "insights": [
@@ -314,12 +336,18 @@ class EnrichmentRequest(BaseModel):
     source: Optional[str] = "manual_enrichment"
 
 
+class ProcessPathsRequest(BaseModel):
+    project_id: str
+    paths: List[str]
+
+
 # -------------------------------
-# PROCESS JOB (chunking + embedding)
+# PROCESS JOB (chunking + embedding em batch)
 # -------------------------------
 def process_job(job_id: str, files_data: List[dict], project_id: str):
     try:
-        job_update(job_id, status="processing", stage="chunking", progress=0)
+        t0 = time.time()
+        job_update(job_id, status="processing", stage="chunking", progress=5)
 
         vector_store = get_vector_store(project_id)
         all_chunks, all_metadata = [], []
@@ -328,6 +356,7 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
             chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
         )
 
+        # ⚡ Chunking paralelo entre arquivos
         with ProcessPoolExecutor() as executor:
             texts = [f["text"] for f in files_data]
             results = list(executor.map(local_splitter.split_text, texts))
@@ -335,7 +364,6 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
         for i, chunks in enumerate(results):
             filename = files_data[i]["filename"]
             for idx, chunk in enumerate(chunks):
-                # >>> ALTERAÇÃO #2: tag de registro SPED na metadata
                 reg = primary_registro(chunk)
                 regs_all = detect_registros(chunk)
                 all_chunks.append(chunk)
@@ -348,41 +376,37 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
                     "registros_all": ",".join(regs_all) if regs_all else "",
                 })
 
-        job_update(job_id, progress=50, stage="embedding")
-
-        BATCH_SIZE = 100
         num_chunks = len(all_chunks)
-        num_batches = (num_chunks + BATCH_SIZE - 1) // BATCH_SIZE
+        print(f"[JOB {job_id}] chunking ok: {num_chunks} chunks em {time.time()-t0:.1f}s")
+        job_update(job_id, progress=30, stage="embedding")
 
-        def add_batch(batch_idx):
+        # ⚡ Inserção em batches grandes; BatchOpenAIEmbeddings faz 256/request internamente
+        INSERT_BATCH = 512
+        num_batches = (num_chunks + INSERT_BATCH - 1) // INSERT_BATCH
+        for b in range(num_batches):
+            start = b * INSERT_BATCH
+            end = min(start + INSERT_BATCH, num_chunks)
             for attempt in range(3):
                 try:
-                    start = batch_idx * BATCH_SIZE
-                    end = min(start + BATCH_SIZE, num_chunks)
                     vector_store.add_texts(
                         texts=all_chunks[start:end],
                         metadatas=all_metadata[start:end],
                     )
-                    return batch_idx
+                    break
                 except Exception as e:
                     if "429" in str(e) and attempt < 2:
-                        time.sleep(2 * (attempt + 1))
-                        continue
+                        time.sleep(2 * (attempt + 1)); continue
                     raise
+            progress = 30 + int(((b + 1) / num_batches) * 70)
+            job_update(job_id, progress=progress)
+            print(f"[JOB {job_id}] batch {b+1}/{num_batches} ok ({end}/{num_chunks})")
 
-        with ThreadPoolExecutor(max_workers=1) as t_executor:
-            futures = []
-            for i in range(num_batches):
-                futures.append(t_executor.submit(add_batch, i))
-                time.sleep(0.2)
-            for idx, future in enumerate(futures):
-                future.result()
-                progress = 50 + int(((idx + 1) / num_batches) * 50)
-                job_update(job_id, progress=progress)
-
+        elapsed = time.time() - t0
+        print(f"[JOB {job_id}] ✅ DONE em {elapsed:.1f}s ({num_chunks} chunks, {len(files_data)} arquivos)")
         job_update(
             job_id, status="completed", stage="done", progress=100,
-            result={"total_chunks": num_chunks, "total_files": len(files_data)},
+            result={"total_chunks": num_chunks, "total_files": len(files_data),
+                    "elapsed_seconds": round(elapsed, 1)},
         )
 
     except Exception as e:
@@ -391,8 +415,9 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
         job_update(job_id, status="error", error=str(e))
 
 
-# >>> ALTERAÇÃO #3: queries dirigidas a blocos diferentes do SPED.
-# Em vez de só `req.query`, fazemos múltiplas buscas e unimos os resultados.
+# -------------------------------
+# Multi-query retrieval p/ sumário
+# -------------------------------
 MULTI_QUERIES = [
     "apuração de PIS COFINS, base de cálculo, alíquota e valor do tributo (registros M100 M200 M500 M600)",
     "documentos fiscais, itens, NCM, CST, CFOP, valor da operação (C100 C170 C190 C500 D100)",
@@ -402,7 +427,6 @@ MULTI_QUERIES = [
 
 
 def multi_query_retrieval(vector_store, base_query: str, per_query_k: int = 8):
-    """Executa várias queries e deduplica por (source, chunk_index)."""
     queries = [base_query] + MULTI_QUERIES
     seen, merged = set(), []
     for q in queries:
@@ -423,7 +447,6 @@ def multi_query_retrieval(vector_store, base_query: str, per_query_k: int = 8):
     return merged
 
 
-# >>> ALTERAÇÃO #5: log de distribuição de registros
 def log_registro_distribution(job_id: str, docs, label: str):
     dist = Counter()
     for d in docs:
@@ -445,9 +468,6 @@ def process_summary_job(job_id: str, req: SummaryRequest):
         mode = "strategic" if "DOCUMENTO 1" in req.template else "audit"
         print(f"[SUMMARY][{job_id}] Mode: {mode}")
 
-        # ===============================
-        # 🔵 AUDIT MODE
-        # ===============================
         if mode == "audit":
             job_update(job_id, stage="retrieving_context")
             context = get_context(req.query, req.project_id, req.k)
@@ -464,35 +484,24 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             job_update(job_id, status="completed", stage="done",
                        result={"mode": mode, "content": response.content})
 
-        # ===============================
-        # 🔴 STRATEGIC MODE
-        # ===============================
         else:
             job_update(job_id, stage="multi_step_rag")
             vector_store = get_vector_store(req.project_id)
 
-            # >>> ALTERAÇÃO #3: multi-query retrieval (em vez de só req.query)
             docs = multi_query_retrieval(vector_store, req.query, per_query_k=8)
             print(f"[SUMMARY][{job_id}] Docs após multi-query: {len(docs)}")
 
-            # Fallback defensivo
             if not docs:
                 print(f"[SUMMARY][{job_id}] ⚠️ multi-query vazio, fallback simples")
                 docs = vector_store.max_marginal_relevance_search(
                     req.query, k=20, fetch_k=40
                 )
 
-            # >>> ALTERAÇÃO #5: distribuição ANTES do cap
             log_registro_distribution(job_id, docs, "pré-cap")
-
-            # >>> ALTERAÇÃO #1: limitar 0450 no contexto
             docs, dropped = cap_registro_chunks(docs, "0450", MAX_0450_CHUNKS)
             print(f"[SUMMARY][{job_id}] 0450 descartados: {dropped}")
-
-            # >>> ALTERAÇÃO #5: distribuição APÓS o cap
             log_registro_distribution(job_id, docs, "pós-cap")
 
-            # Log detalhado
             for i, doc in enumerate(docs, start=1):
                 src = doc.metadata.get("source", "?")
                 reg = doc.metadata.get("registro") or primary_registro(doc.page_content) or "?"
@@ -552,7 +561,6 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                     continue
 
                 evidencias = data.get("evidencias") or []
-
                 if not evidencias:
                     print(f"[SUMMARY][{job_id}] ⚠️ FILTER {idx}: fallback bruto")
                     evidencias = [{
@@ -588,7 +596,6 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             {req.enrichment}
             """
 
-            # >>> ALTERAÇÃO #4: regras de formatação no prompt final
             final_prompt = f"""
             {req.template}
 
@@ -610,11 +617,11 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             5. Ao numerar seções, SUBSTITUA qualquer placeholder do tipo `X.N` pelo número
                real do capítulo. NUNCA escreva `X.`, `.3`, `X.3` literais no texto final.
                Exemplo correto: "4.3 Cálculo do Impacto Financeiro" (não "X.3").
-            6. NÃO duplique títulos de seção (ex.: não repita "X.3 Cálculo do Impacto..." 3x).
-            7. Registros 0450 são INFORMAÇÕES COMPLEMENTARES (dicionário de observações).
-               NÃO os use como base para cálculo de impacto financeiro ou ROI — esses cálculos
-               devem vir de M100/M200/M500/M600 e itens C170. Se faltar essa base, declare
-               ausência explicitamente em vez de citar 0450.
+            6. NÃO duplique títulos de seção.
+            7. Registros 0450 são INFORMAÇÕES COMPLEMENTARES. NÃO os use como base para
+               cálculo de impacto financeiro ou ROI — esses cálculos devem vir de
+               M100/M200/M500/M600 e itens C170. Se faltar essa base, declare ausência
+               explicitamente em vez de citar 0450.
             """
 
             job_update(job_id, stage="final_llm")
@@ -632,8 +639,22 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
 
 # -------------------------------
-# ENDPOINTS  (inalterados)
+# ENRICHMENT
 # -------------------------------
+def enrichment_to_text(data, parent_key=""):
+    texts = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            new_key = f"{parent_key}.{key}" if parent_key else key
+            texts.append(enrichment_to_text(value, new_key))
+    elif isinstance(data, list):
+        for idx, item in enumerate(data):
+            texts.append(enrichment_to_text(item, f"{parent_key}[{idx}]"))
+    else:
+        texts.append(f"{parent_key}: {data}")
+    return "\n".join(texts)
+
+
 @app.post("/enrichment")
 async def upload_enrichment(req: EnrichmentRequest):
     try:
@@ -654,20 +675,9 @@ async def upload_enrichment(req: EnrichmentRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def enrichment_to_text(data, parent_key=""):
-    texts = []
-    if isinstance(data, dict):
-        for key, value in data.items():
-            new_key = f"{parent_key}.{key}" if parent_key else key
-            texts.append(enrichment_to_text(value, new_key))
-    elif isinstance(data, list):
-        for idx, item in enumerate(data):
-            texts.append(enrichment_to_text(item, f"{parent_key}[{idx}]"))
-    else:
-        texts.append(f"{parent_key}: {data}")
-    return "\n".join(texts)
-
-
+# -------------------------------
+# UPLOAD (legado — mantido para compatibilidade)
+# -------------------------------
 @app.post("/upload")
 async def upload_documents(project_id: str, files: List[UploadFile] = File(...)):
     try:
@@ -694,6 +704,57 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# -------------------------------
+# ⚡ NOVO: /process-paths — backend baixa direto do Storage
+# -------------------------------
+def _download_file(path: str) -> Optional[dict]:
+    try:
+        data = supabase.storage.from_(BUCKET_NAME).download(path)
+        text = data.decode("utf-8", errors="ignore")
+        if not text.strip():
+            return None
+        filename = path.split("/")[-1]
+        return {"filename": filename, "text": text}
+    except Exception as e:
+        print(f"[download] falhou {path}: {e}")
+        return None
+
+
+@app.post("/process-paths")
+def process_paths(req: ProcessPathsRequest):
+    try:
+        if not req.project_id or not req.paths:
+            raise HTTPException(status_code=400, detail="project_id e paths obrigatórios")
+
+        job_id = str(uuid.uuid4())
+        job_create(job_id, kind="process", project_id=req.project_id)
+
+        def runner():
+            try:
+                job_update(job_id, status="processing", stage="downloading", progress=1)
+                t0 = time.time()
+                # ⚡ Download paralelo (16 threads) usando SUPABASE_SERVICE_KEY
+                with ThreadPoolExecutor(max_workers=16) as ex:
+                    results = list(ex.map(_download_file, req.paths))
+                files_data = [r for r in results if r is not None]
+                print(f"[JOB {job_id}] download {len(files_data)}/{len(req.paths)} em {time.time()-t0:.1f}s")
+                if not files_data:
+                    job_update(job_id, status="error", error="Nenhum arquivo válido baixado")
+                    return
+                process_job(job_id, files_data, req.project_id)
+            except Exception as e:
+                print(traceback.format_exc())
+                job_update(job_id, status="error", error=str(e))
+
+        threading.Thread(target=runner).start()
+        return {"job_id": job_id, "project_id": req.project_id, "total_files": len(req.paths)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -------------------------------
+# DELETE PROJECT
+# -------------------------------
 @app.delete("/delete-project/{project_id}")
 def delete_project(project_id: str, folder_path: str):
     try:
@@ -721,6 +782,9 @@ def delete_project(project_id: str, folder_path: str):
         raise HTTPException(status_code=500, detail=f"Erro ao deletar projeto: {str(e)}")
 
 
+# -------------------------------
+# STATUS
+# -------------------------------
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
     job = job_get(job_id)
@@ -737,6 +801,9 @@ def get_summary_status(job_id: str):
     return job
 
 
+# -------------------------------
+# SUMMARY
+# -------------------------------
 @app.post("/generate-summary")
 async def generate_summary(req: SummaryRequest):
     try:
