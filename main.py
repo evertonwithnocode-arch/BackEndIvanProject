@@ -136,20 +136,48 @@ EMBED_BATCH = 256
 class BatchOpenAIEmbeddings(Embeddings):
     """Embeddings em lote (256 textos por request) — ~10x mais rápido."""
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        out: List[List[float]] = []
-        for i in range(0, len(texts), EMBED_BATCH):
-            batch = texts[i:i + EMBED_BATCH]
-            for attempt in range(4):
-                try:
-                    resp = openai_client.embeddings.create(model=EMBED_MODEL, input=batch)
-                    out.extend([d.embedding for d in resp.data])
-                    break
-                except Exception as e:
-                    msg = str(e)
-                    if ("429" in msg or "rate" in msg.lower()) and attempt < 3:
-                        time.sleep(2 ** attempt)
-                        continue
-                    raise
+     out: List[List[float]] = []
+     for i in range(0, len(texts), EMBED_BATCH):
+        batch = texts[i:i + EMBED_BATCH]
+        for attempt in range(4):
+            try:
+                resp = openai_client.embeddings.create(model=EMBED_MODEL, input=batch)
+                out.extend([d.embedding for d in resp.data])
+                break
+            except Exception as e:
+                msg = str(e)
+                low = msg.lower()
+
+                # Sem créditos / quota esgotada → não adianta retry
+                if "insufficient_quota" in low or "exceeded your current quota" in low:
+                    raise RuntimeError(
+                        "OpenAI sem créditos disponíveis. "
+                        "Adicione saldo em https://platform.openai.com/account/billing "
+                        "e tente novamente."
+                    ) from e
+
+                # Chave inválida / sem permissão
+                if "invalid_api_key" in low or "incorrect api key" in low:
+                    raise RuntimeError(
+                        "OPENAI_API_KEY inválida ou sem permissão para embeddings."
+                    ) from e
+
+                # Rate limit temporário → backoff exponencial
+                is_rate = "429" in msg or "rate limit" in low or "ratelimit" in low
+                if is_rate and attempt < 3:
+                    wait = 2 ** attempt
+                    print(f"[embed] rate limit (batch {i}, tentativa {attempt+1}/4) — aguardando {wait}s")
+                    time.sleep(wait)
+                    continue
+
+                # Erros transitórios de rede/servidor → backoff
+                if any(c in msg for c in ("500", "502", "503", "504", "timeout", "Timeout")) and attempt < 3:
+                    wait = 2 ** attempt
+                    print(f"[embed] erro transitório ({msg[:80]}) — retry em {wait}s")
+                    time.sleep(wait)
+                    continue
+
+                raise
         return out
 
     def embed_query(self, text: str) -> List[float]:
