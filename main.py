@@ -29,11 +29,28 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Limite seguro de caracteres por chunk (≈ 8191 tokens * 4 chars/token =
-# ~32k; usamos margem)
+# Limite seguro de caracteres por chunk (~8191 tokens * 4 chars/token = ~32k; usamos margem)
 MAX_CHARS_PER_CHUNK = 24000
 # OpenAI rejeita string vazia; usamos espaço para manter alinhamento
 EMPTY_PLACEHOLDER = " "
+
+
+def _sanitize_texts(texts: List[str]) -> List[str]:
+    """Garante que toda entrada tenha pelo menos 1 char e não exceda o limite do modelo."""
+    cleaned: List[str] = []
+    for t in texts:
+        if t is None:
+            cleaned.append(EMPTY_PLACEHOLDER)
+            continue
+        s = str(t).strip()
+        if not s:
+            s = EMPTY_PLACEHOLDER
+        if len(s) > MAX_CHARS_PER_CHUNK:
+            s = s[:MAX_CHARS_PER_CHUNK]
+        cleaned.append(s)
+    return cleaned
+
+
 # -------------------------------
 # SUPABASE
 # -------------------------------
@@ -146,28 +163,14 @@ EMBED_BATCH = 256
 
 class BatchOpenAIEmbeddings(Embeddings):
     """Embeddings em lote (256 textos por request) — ~10x mais rápido."""
-    def _sanitize_texts(texts: List[str]) -> List[str]:
-     """Garante que toda entrada tenha pelo menos 1 char e não exceda o limite do modelo."""
-     cleaned: List[str] = []
-     for t in texts:
-         if t is None:
-             cleaned.append(EMPTY_PLACEHOLDER)
-             continue
-         s = str(t).strip()
-         if not s:
-             s = EMPTY_PLACEHOLDER
-         if len(s) > MAX_CHARS_PER_CHUNK:
-             s = s[:MAX_CHARS_PER_CHUNK]
-         cleaned.append(s)
-     return cleaned
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """
         Gera embeddings garantindo:
          - 1 embedding por texto de entrada (alinhamento com langchain-chroma)
-        - Tratamento de 429 (rate limit) com backoff
-        - Tratamento explícito de 'insufficient_quota' (sem créditos)
-        - Sanitização de textos vazios/oversize
+         - Tratamento de 429 (rate limit) com backoff
+         - Tratamento explícito de 'insufficient_quota' (sem créditos)
+         - Sanitização de textos vazios/oversize
         """
         if not texts:
             return []
@@ -187,7 +190,7 @@ class BatchOpenAIEmbeddings(Embeddings):
                     )
                     embeddings_batch = [d.embedding for d in resp.data]
 
-                            # 🔒 Validação crítica: a OpenAI DEVE retornar 1 embedding por input.
+                    # 🔒 Validação crítica: a OpenAI DEVE retornar 1 embedding por input.
                     if len(embeddings_batch) != len(batch):
                         raise RuntimeError(
                             f"OpenAI retornou {len(embeddings_batch)} embeddings "
@@ -197,7 +200,7 @@ class BatchOpenAIEmbeddings(Embeddings):
                     break
 
                 except AuthenticationError as e:
-                # Chave inválida ou removida — não adianta tentar de novo
+                    # Chave inválida ou removida — não adianta tentar de novo
                     logger.error("OpenAI auth error: %s", e)
                     raise RuntimeError(
                         "OpenAI API Key inválida ou revogada. "
@@ -250,14 +253,14 @@ class BatchOpenAIEmbeddings(Embeddings):
                     f"após todas as tentativas."
                 )
 
-        out.extend(embeddings_batch)
+            out.extend(embeddings_batch)
 
         # 🔒 Validação final: total de embeddings == total de textos
         if len(out) != len(texts):
             raise RuntimeError(
                 f"Inconsistência crítica: {len(out)} embeddings gerados para {len(texts)} textos. "
-                       f"Isso causaria IndexError no Chroma."
-                   )
+                f"Isso causaria IndexError no Chroma."
+            )
 
         return out
 
