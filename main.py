@@ -270,7 +270,7 @@ class BatchOpenAIEmbeddings(Embeddings):
 
 
 embeddings = BatchOpenAIEmbeddings()
-llm = ChatOpenAI(model="gpt-5", temperature=0.0, api_key=OPENAI_API_KEY)
+llm = ChatOpenAI(model="gpt-4.1", temperature=0.0, api_key=OPENAI_API_KEY)
 
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
