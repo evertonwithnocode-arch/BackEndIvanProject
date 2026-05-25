@@ -1,30 +1,39 @@
+import re
+import json
+from openai import RateLimitError, APIError, AuthenticationError, BadRequestError
+from typing import List
+import logging
+from openai import OpenAI
+from supabase import create_client
+from langchain_core.embeddings import Embeddings
+from langchain_chroma import Chroma
+from langchain_openai import ChatOpenAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from typing import List, Optional, Dict
+from collections import Counter
+import time
+import asyncio
+import shutil
+import traceback
+import threading
+import uuid
+import os
 from dotenv import load_dotenv
 load_dotenv()
 
-import os
-import uuid
-import threading
-import traceback
-import shutil
-import asyncio
-import time
-from collections import Counter
-from typing import List, Optional, Dict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+logger = logging.getLogger(__name__)
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import ChatOpenAI
-from langchain_chroma import Chroma
-from langchain_core.embeddings import Embeddings
-import json, re
-from supabase import create_client
-from openai import OpenAI
-
+# Limite seguro de caracteres por chunk (≈ 8191 tokens * 4 chars/token =
+# ~32k; usamos margem)
+MAX_CHARS_PER_CHUNK = 24000
+# OpenAI rejeita string vazia; usamos espaço para manter alinhamento
+EMPTY_PLACEHOLDER = " "
 # -------------------------------
 # SUPABASE
 # -------------------------------
@@ -64,7 +73,8 @@ def job_update(job_id, **fields):
 
 def job_get(job_id):
     try:
-        res = supabase.table(JOBS_TABLE).select("*").eq("id", job_id).limit(1).execute()
+        res = supabase.table(JOBS_TABLE).select(
+            "*").eq("id", job_id).limit(1).execute()
         return res.data[0] if res.data else None
     except Exception as e:
         print(f"[job_get] erro {job_id}: {e}")
@@ -106,7 +116,8 @@ async def verify_api_key(request: Request, call_next):
     if any(request.url.path.startswith(route) for route in PUBLIC_ROUTES):
         return await call_next(request)
     if request.headers.get("x-api-key") != INTERNAL_API_KEY:
-        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+        return JSONResponse(status_code=401, content={
+                            "detail": "Unauthorized"})
     return await call_next(request)
 
 
@@ -135,49 +146,119 @@ EMBED_BATCH = 256
 
 class BatchOpenAIEmbeddings(Embeddings):
     """Embeddings em lote (256 textos por request) — ~10x mais rápido."""
+    def _sanitize_texts(texts: List[str]) -> List[str]:
+     """Garante que toda entrada tenha pelo menos 1 char e não exceda o limite do modelo."""
+     cleaned: List[str] = []
+     for t in texts:
+         if t is None:
+             cleaned.append(EMPTY_PLACEHOLDER)
+             continue
+         s = str(t).strip()
+         if not s:
+             s = EMPTY_PLACEHOLDER
+         if len(s) > MAX_CHARS_PER_CHUNK:
+             s = s[:MAX_CHARS_PER_CHUNK]
+         cleaned.append(s)
+     return cleaned
+
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-     out: List[List[float]] = []
-     for i in range(0, len(texts), EMBED_BATCH):
-        batch = texts[i:i + EMBED_BATCH]
-        for attempt in range(4):
-            try:
-                resp = openai_client.embeddings.create(model=EMBED_MODEL, input=batch)
-                out.extend([d.embedding for d in resp.data])
-                break
-            except Exception as e:
-                msg = str(e)
-                low = msg.lower()
+        """
+        Gera embeddings garantindo:
+         - 1 embedding por texto de entrada (alinhamento com langchain-chroma)
+        - Tratamento de 429 (rate limit) com backoff
+        - Tratamento explícito de 'insufficient_quota' (sem créditos)
+        - Sanitização de textos vazios/oversize
+        """
+        if not texts:
+            return []
 
-                # Sem créditos / quota esgotada → não adianta retry
-                if "insufficient_quota" in low or "exceeded your current quota" in low:
+        safe_texts = _sanitize_texts(texts)
+        out: List[List[float]] = []
+
+        for i in range(0, len(safe_texts), EMBED_BATCH):
+            batch = safe_texts[i:i + EMBED_BATCH]
+            embeddings_batch: List[List[float]] = []
+
+            for attempt in range(5):
+                try:
+                    resp = openai_client.embeddings.create(
+                        model=EMBED_MODEL,
+                        input=batch,
+                    )
+                    embeddings_batch = [d.embedding for d in resp.data]
+
+                            # 🔒 Validação crítica: a OpenAI DEVE retornar 1 embedding por input.
+                    if len(embeddings_batch) != len(batch):
+                        raise RuntimeError(
+                            f"OpenAI retornou {len(embeddings_batch)} embeddings "
+                            f"para {len(batch)} inputs (batch {i}-{i+len(batch)}). "
+                            f"Resposta desalinhada."
+                        )
+                    break
+
+                except AuthenticationError as e:
+                # Chave inválida ou removida — não adianta tentar de novo
+                    logger.error("OpenAI auth error: %s", e)
                     raise RuntimeError(
-                        "OpenAI sem créditos disponíveis. "
-                        "Adicione saldo em https://platform.openai.com/account/billing "
-                        "e tente novamente."
+                        "OpenAI API Key inválida ou revogada. "
+                        "Verifique OPENAI_API_KEY no .env do backend."
                     ) from e
 
-                # Chave inválida / sem permissão
-                if "invalid_api_key" in low or "incorrect api key" in low:
-                    raise RuntimeError(
-                        "OPENAI_API_KEY inválida ou sem permissão para embeddings."
-                    ) from e
+                except RateLimitError as e:
+                    msg = str(e)
+                    # 'insufficient_quota' NÃO é rate limit transitório — é falta de créditos.
+                    # Retentar não resolve; falhar rápido com mensagem clara.
+                    if "insufficient_quota" in msg or "exceeded your current quota" in msg:
+                        logger.error("OpenAI sem créditos: %s", msg)
+                        raise RuntimeError(
+                            "OpenAI sem créditos disponíveis (insufficient_quota). "
+                            "Adicione saldo em https://platform.openai.com/account/billing "
+                            "e tente novamente."
+                        ) from e
 
-                # Rate limit temporário → backoff exponencial
-                is_rate = "429" in msg or "rate limit" in low or "ratelimit" in low
-                if is_rate and attempt < 3:
-                    wait = 2 ** attempt
-                    print(f"[embed] rate limit (batch {i}, tentativa {attempt+1}/4) — aguardando {wait}s")
-                    time.sleep(wait)
-                    continue
+                    if attempt < 4:
+                        wait = 2 ** attempt
+                        logger.warning("Rate limit OpenAI (tentativa %d/5). Aguardando %ds...", attempt + 1, wait)
+                        time.sleep(wait)
+                        continue
+                    raise
 
-                # Erros transitórios de rede/servidor → backoff
-                if any(c in msg for c in ("500", "502", "503", "504", "timeout", "Timeout")) and attempt < 3:
-                    wait = 2 ** attempt
-                    print(f"[embed] erro transitório ({msg[:80]}) — retry em {wait}s")
-                    time.sleep(wait)
-                    continue
+                except BadRequestError as e:
+                    # Provavelmente input inválido (token > 8191, encoding). Loga e propaga.
+                    logger.error("OpenAI bad request no batch %d-%d: %s", i, i + len(batch), e)
+                    raise
 
-                raise
+                except APIError as e:
+                    # Erro transitório do lado da OpenAI (5xx)
+                    if attempt < 4:
+                        wait = 2 ** attempt
+                        logger.warning("OpenAI APIError (tentativa %d/5): %s. Aguardando %ds...", attempt + 1, e, wait)
+                        time.sleep(wait)
+                        continue
+                    raise
+
+                except Exception as e:
+                    msg = str(e)
+                    if ("429" in msg or "rate" in msg.lower()) and attempt < 4:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise
+
+            if len(embeddings_batch) != len(batch):
+                raise RuntimeError(
+                    f"Falha ao gerar embeddings completos para batch {i}-{i+len(batch)} "
+                    f"após todas as tentativas."
+                )
+
+        out.extend(embeddings_batch)
+
+        # 🔒 Validação final: total de embeddings == total de textos
+        if len(out) != len(texts):
+            raise RuntimeError(
+                f"Inconsistência crítica: {len(out)} embeddings gerados para {len(texts)} textos. "
+                       f"Isso causaria IndexError no Chroma."
+                   )
+
         return out
 
     def embed_query(self, text: str) -> List[float]:
