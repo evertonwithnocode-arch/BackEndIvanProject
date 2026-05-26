@@ -9,12 +9,13 @@ from langchain_core.embeddings import Embeddings
 from langchain_chroma import Chroma
 from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.callbacks.manager import get_openai_callback
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple, Any
 from collections import Counter
 import time
 import asyncio
@@ -49,6 +50,48 @@ def _sanitize_texts(texts: List[str]) -> List[str]:
             s = s[:MAX_CHARS_PER_CHUNK]
         cleaned.append(s)
     return cleaned
+
+
+# -------------------------------
+# 🆕 #3 — DECODER INTELIGENTE PARA SPED (BOM / latin-1 / cp1252)
+# -------------------------------
+def smart_decode_sped(raw: bytes) -> str:
+    """
+    Detecta encoding correto de arquivos SPED preservando acentuação.
+    Ordem: BOM UTF-8/UTF-16 -> utf-8 estrito -> latin-1 -> cp1252.
+    Nunca usa errors='ignore' (que era o que perdia acentos).
+    """
+    if not raw:
+        return ""
+
+    # 1) BOM explícito
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig", errors="replace")
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16", errors="replace")
+
+    # 2) Tenta UTF-8 estrito (SPEDs mais novos)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    # 3) latin-1 / ISO-8859-1 (padrão histórico do SPED)
+    try:
+        decoded = raw.decode("latin-1")
+        # Heurística: se houver muitos caracteres "estranhos" comuns em cp1252 mal-lido,
+        # tenta cp1252 que cobre aspas tipográficas, travessões, etc.
+        if any(c in decoded for c in ("\x80", "\x82", "\x83", "\x84", "\x85", "\x86", "\x87", "\x88", "\x89")):
+            try:
+                return raw.decode("cp1252")
+            except UnicodeDecodeError:
+                return decoded
+        return decoded
+    except UnicodeDecodeError:
+        pass
+
+    # 4) Último recurso
+    return raw.decode("utf-8", errors="replace")
 
 
 # -------------------------------
@@ -160,18 +203,14 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 EMBED_MODEL = "text-embedding-3-small"
 EMBED_BATCH = 256
 
+# 🆕 #2 — modelo declarado em const para fácil propagação ao Supabase
+LLM_MODEL = "gpt-4.1"
+
 
 class BatchOpenAIEmbeddings(Embeddings):
     """Embeddings em lote (256 textos por request) — ~10x mais rápido."""
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """
-        Gera embeddings garantindo:
-         - 1 embedding por texto de entrada (alinhamento com langchain-chroma)
-         - Tratamento de 429 (rate limit) com backoff
-         - Tratamento explícito de 'insufficient_quota' (sem créditos)
-         - Sanitização de textos vazios/oversize
-        """
         if not texts:
             return []
 
@@ -190,7 +229,6 @@ class BatchOpenAIEmbeddings(Embeddings):
                     )
                     embeddings_batch = [d.embedding for d in resp.data]
 
-                    # 🔒 Validação crítica: a OpenAI DEVE retornar 1 embedding por input.
                     if len(embeddings_batch) != len(batch):
                         raise RuntimeError(
                             f"OpenAI retornou {len(embeddings_batch)} embeddings "
@@ -200,7 +238,6 @@ class BatchOpenAIEmbeddings(Embeddings):
                     break
 
                 except AuthenticationError as e:
-                    # Chave inválida ou removida — não adianta tentar de novo
                     logger.error("OpenAI auth error: %s", e)
                     raise RuntimeError(
                         "OpenAI API Key inválida ou revogada. "
@@ -209,8 +246,6 @@ class BatchOpenAIEmbeddings(Embeddings):
 
                 except RateLimitError as e:
                     msg = str(e)
-                    # 'insufficient_quota' NÃO é rate limit transitório — é falta de créditos.
-                    # Retentar não resolve; falhar rápido com mensagem clara.
                     if "insufficient_quota" in msg or "exceeded your current quota" in msg:
                         logger.error("OpenAI sem créditos: %s", msg)
                         raise RuntimeError(
@@ -227,12 +262,10 @@ class BatchOpenAIEmbeddings(Embeddings):
                     raise
 
                 except BadRequestError as e:
-                    # Provavelmente input inválido (token > 8191, encoding). Loga e propaga.
                     logger.error("OpenAI bad request no batch %d-%d: %s", i, i + len(batch), e)
                     raise
 
                 except APIError as e:
-                    # Erro transitório do lado da OpenAI (5xx)
                     if attempt < 4:
                         wait = 2 ** attempt
                         logger.warning("OpenAI APIError (tentativa %d/5): %s. Aguardando %ds...", attempt + 1, e, wait)
@@ -255,7 +288,6 @@ class BatchOpenAIEmbeddings(Embeddings):
 
             out.extend(embeddings_batch)
 
-        # 🔒 Validação final: total de embeddings == total de textos
         if len(out) != len(texts):
             raise RuntimeError(
                 f"Inconsistência crítica: {len(out)} embeddings gerados para {len(texts)} textos. "
@@ -270,7 +302,7 @@ class BatchOpenAIEmbeddings(Embeddings):
 
 
 embeddings = BatchOpenAIEmbeddings()
-llm = ChatOpenAI(model="gpt-4.1", temperature=0.0, api_key=OPENAI_API_KEY)
+llm = ChatOpenAI(model=LLM_MODEL, temperature=0.0, api_key=OPENAI_API_KEY)
 
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
@@ -297,6 +329,13 @@ def get_vector_store(project_id: str):
 # -------------------------------
 SPED_REGISTRO_REGEX = re.compile(r"^\|([0-9A-Z]{4})\|", re.MULTILINE)
 
+# 🆕 #5 — regex para extrair período do registro 0000 (DT_INI|DT_FIN são os campos 4 e 5)
+# Formato típico: |0000|VER|COD_FIN|DT_INI|DT_FIN|NOME|CNPJ|...
+SPED_0000_REGEX = re.compile(
+    r"\|0000\|[^|]*\|[^|]*\|(\d{8})\|(\d{8})\|",
+    re.MULTILINE,
+)
+
 
 def detect_registros(text: str) -> List[str]:
     if not text:
@@ -317,6 +356,29 @@ def primary_registro(text: str) -> Optional[str]:
     if not matches:
         return None
     return Counter(matches).most_common(1)[0][0]
+
+
+def extract_periodo_from_docs(docs) -> Optional[str]:
+    """
+    🆕 #5 — Varre chunks atrás de registros |0000| e extrai DT_INI/DT_FIN.
+    Retorna string formatada tipo 'DD/MM/AAAA a DD/MM/AAAA' ou None.
+    """
+    dt_inis, dt_fins = [], []
+    for d in docs:
+        text = getattr(d, "page_content", "") or ""
+        for m in SPED_0000_REGEX.finditer(text):
+            dt_ini_raw, dt_fin_raw = m.group(1), m.group(2)
+            try:
+                dt_inis.append(f"{dt_ini_raw[0:2]}/{dt_ini_raw[2:4]}/{dt_ini_raw[4:8]}")
+                dt_fins.append(f"{dt_fin_raw[0:2]}/{dt_fin_raw[2:4]}/{dt_fin_raw[4:8]}")
+            except Exception:
+                continue
+    if not dt_inis or not dt_fins:
+        return None
+    # menor DT_INI, maior DT_FIN
+    sorted_ini = sorted(dt_inis, key=lambda x: (x[6:10], x[3:5], x[0:2]))
+    sorted_fin = sorted(dt_fins, key=lambda x: (x[6:10], x[3:5], x[0:2]))
+    return f"{sorted_ini[0]} a {sorted_fin[-1]}"
 
 
 MAX_0450_CHUNKS = 2
@@ -371,7 +433,7 @@ Registro: {reg}
         raise HTTPException(status_code=500, detail=f"Erro ao buscar contexto: {str(e)}")
 
 
-def build_prompt(template: str, context: str, enrichment: dict | None):
+def build_prompt(template: str, context: str, enrichment: dict | None, periodo: Optional[str] = None):
     enrichment_text = ""
     if enrichment:
         enrichment_text = f"""
@@ -381,11 +443,21 @@ DADOS DE ENRIQUECIMENTO
 {enrichment}
 """
 
+    # 🆕 #5 — bloco de período fixo no topo
+    periodo_block = ""
+    if periodo:
+        periodo_block = f"""
+====================
+PERÍODO ANALISADO (extraído do registro 0000)
+====================
+{periodo}
+"""
+
     return f"""
 Você é um auditor fiscal especialista em SPED (EFD PIS/COFINS).
 
 Sua função é identificar inconsistências reais, validar cálculos e garantir integridade dos dados.
-
+{periodo_block}
 ====================
 CONTEXTO
 ====================
@@ -415,6 +487,9 @@ REGRAS DE AUDITORIA (OBRIGATÓRIAS)
    NUNCA escreva `X.` literal no texto final (ex.: use "4.3" e não "X.3" ou ".3").
 10. Se um item realmente não tiver dado, escreva "Dado não disponível nos arquivos analisados"
     SOMENTE uma vez por seção — não duplique.
+11. Sempre que mencionar o período da análise, use exatamente o período informado no bloco
+    "PERÍODO ANALISADO" acima. Só escreva "Dado não disponível" para período se aquele bloco
+    estiver ausente.
 
 {{
   "insights": [
@@ -468,7 +543,6 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
             chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
         )
 
-        # ⚡ Chunking paralelo entre arquivos
         with ProcessPoolExecutor() as executor:
             texts = [f["text"] for f in files_data]
             results = list(executor.map(local_splitter.split_text, texts))
@@ -492,7 +566,6 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
         print(f"[JOB {job_id}] chunking ok: {num_chunks} chunks em {time.time()-t0:.1f}s")
         job_update(job_id, progress=30, stage="embedding")
 
-        # ⚡ Inserção em batches grandes; BatchOpenAIEmbeddings faz 256/request internamente
         INSERT_BATCH = 512
         num_batches = (num_chunks + INSERT_BATCH - 1) // INSERT_BATCH
         for b in range(num_batches):
@@ -528,34 +601,93 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
 
 
 # -------------------------------
-# Multi-query retrieval p/ sumário
+# 🆕 #1 — Multi-query retrieval ADAPTATIVO por template
 # -------------------------------
-MULTI_QUERIES = [
-    "apuração de PIS COFINS, base de cálculo, alíquota e valor do tributo (registros M100 M200 M500 M600)",
-    "documentos fiscais, itens, NCM, CST, CFOP, valor da operação (C100 C170 C190 C500 D100)",
-    "totais consolidados, ajustes e créditos do período",
-    "inconsistências, divergências entre totais e itens, valores zerados ou duplicados",
+# Queries direcionadas para registros de APURAÇÃO (prioridade máxima)
+APURACAO_QUERIES = [
+    "M100 M105 base de cálculo crédito PIS valor alíquota",
+    "M200 M205 M210 apuração contribuição PIS COFINS valor devido",
+    "M500 M505 M600 M605 M610 crédito COFINS débito apuração",
+    "E110 E116 apuração ICMS débitos créditos saldo",
+    "E520 E530 apuração IPI período",
+]
+
+# Queries para documentos fiscais com VALORES
+FISCAIS_QUERIES = [
+    "C100 nota fiscal valor total operação ICMS",
+    "C170 item nota fiscal NCM CST CFOP valor unitário",
+    "C190 C500 D100 análise consolidada itens",
+]
+
+# Queries para cadastros/contexto (peso menor)
+CADASTRAIS_QUERIES = [
+    "0000 abertura arquivo período empresa CNPJ",
+    "0150 participantes fornecedores clientes",
+    "0200 0220 itens produtos serviços fatores conversão",
+    "totais consolidados ajustes créditos do período",
+    "inconsistências divergências entre totais e itens valores zerados",
 ]
 
 
-def multi_query_retrieval(vector_store, base_query: str, per_query_k: int = 8):
-    queries = [base_query] + MULTI_QUERIES
+def _is_analise_completa(template: str) -> bool:
+    """Detecta heurísticamente o template 'Análise Completa' / strategic."""
+    if not template:
+        return False
+    t = template.lower()
+    keywords = ["análise completa", "analise completa", "relatório executivo estratégico",
+                "documento 1", "consolidação final", "consolidacao final"]
+    return any(kw in t for kw in keywords)
+
+
+def multi_query_retrieval(
+    vector_store,
+    base_query: str,
+    per_query_k: int = 8,
+    template: str = "",
+) -> List[Any]:
+    """
+    Multi-step retrieval. Para Análise Completa:
+      passo 1: APURACAO (M100/M200/M500/E110) com k maior
+      passo 2: FISCAIS  (C100/C170/C190)
+      passo 3: CADASTRAIS (0000/0150) com k menor
+    Para audit comum: mantém comportamento anterior (queries unificadas).
+    """
+    analise_completa = _is_analise_completa(template)
+
+    if analise_completa:
+        # Multi-step ponderado
+        steps: List[Tuple[List[str], int, str]] = [
+            (APURACAO_QUERIES, max(per_query_k, 10), "APURACAO"),
+            (FISCAIS_QUERIES, max(per_query_k, 8), "FISCAIS"),
+            (CADASTRAIS_QUERIES, max(per_query_k // 2, 4), "CADASTRAIS"),
+        ]
+        # Inclui base_query no primeiro passo
+        steps[0] = ([base_query] + steps[0][0], steps[0][1], steps[0][2])
+    else:
+        # Comportamento original consolidado
+        legacy_queries = [base_query] + APURACAO_QUERIES[:2] + FISCAIS_QUERIES[:2] + CADASTRAIS_QUERIES[3:]
+        steps = [(legacy_queries, per_query_k, "LEGACY")]
+
     seen, merged = set(), []
-    for q in queries:
-        try:
-            docs = vector_store.max_marginal_relevance_search(
-                q, k=per_query_k, fetch_k=per_query_k * 3,
-                filter={"type": "document"},
-            )
-        except Exception as e:
-            print(f"[multi_query_retrieval] falhou query={q[:40]!r}: {e}")
-            continue
-        for d in docs:
-            key = (d.metadata.get("source"), d.metadata.get("chunk_index"))
-            if key in seen:
+    for queries, k_step, label in steps:
+        before = len(merged)
+        for q in queries:
+            try:
+                docs = vector_store.max_marginal_relevance_search(
+                    q, k=k_step, fetch_k=k_step * 3,
+                    filter={"type": "document"},
+                )
+            except Exception as e:
+                print(f"[multi_query_retrieval][{label}] falhou query={q[:40]!r}: {e}")
                 continue
-            seen.add(key)
-            merged.append(d)
+            for d in docs:
+                key = (d.metadata.get("source"), d.metadata.get("chunk_index"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(d)
+        print(f"[multi_query_retrieval][{label}] +{len(merged)-before} novos (total={len(merged)})")
+
     return merged
 
 
@@ -570,43 +702,214 @@ def log_registro_distribution(job_id: str, docs, label: str):
 
 
 # -------------------------------
+# 🆕 #4 — POS-PROCESSAMENTO ESTRUTURAL DO MARKDOWN
+# -------------------------------
+RE_CALC_LINE = re.compile(r"([A-Z][^=:]{3,60})\s*[:=]\s*(R\$\s?[\d\.,]+|\d[\d\.,]*)\s*(.*)")
+RE_EVIDENCE_PIPE = re.compile(r"\|\s*([0-9A-Z]{4})\s*\|[^|\n]{2,200}\|")
+RE_BULLET = re.compile(r"^\s*(?:[-*•]|\d+[\.\)])\s+(.{15,})$", re.MULTILINE)
+
+
+def _split_markdown_sections(markdown: str) -> Dict[str, str]:
+    """Divide markdown por headers ##/### retornando dict {titulo_normalizado: corpo}."""
+    sections: Dict[str, str] = {}
+    if not markdown:
+        return sections
+    lines = markdown.splitlines()
+    current_title = "_intro"
+    buf: List[str] = []
+    for ln in lines:
+        m = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", ln)
+        if m:
+            sections[current_title] = "\n".join(buf).strip()
+            current_title = re.sub(r"[^a-z0-9]+", "_", m.group(1).lower()).strip("_")
+            buf = []
+        else:
+            buf.append(ln)
+    sections[current_title] = "\n".join(buf).strip()
+    return sections
+
+
+def parse_summary_markdown(markdown: str) -> Dict[str, List[Any]]:
+    """
+    Faz best-effort para extrair:
+      - insights: bullets das seções de sumário/recomendações/inteligência
+      - calculations: linhas com 'Nome: R$ valor' ou 'X = N'
+      - data_crossings: blocos que citam múltiplos registros (ex.: C100 vs C170)
+      - source_references: trechos no formato |REG|...| extraídos como evidências
+    """
+    result = {
+        "insights": [],
+        "calculations": [],
+        "data_crossings": [],
+        "source_references": [],
+    }
+    if not markdown:
+        return result
+
+    sections = _split_markdown_sections(markdown)
+
+    # --- insights: bullets das seções relevantes ---
+    insight_keywords = ("sumario", "sumário", "executivo", "recomenda", "oportunidade",
+                        "inteligencia", "inteligência", "achados", "risco")
+    seen_insights = set()
+    for title, body in sections.items():
+        if not any(kw in title for kw in ("sumar", "exec", "recomend", "oportun", "intelig", "achad", "risco")):
+            continue
+        for m in RE_BULLET.finditer(body):
+            text = m.group(1).strip()
+            text = re.sub(r"\*\*", "", text)
+            if "dado não disponível" in text.lower():
+                continue
+            if text.lower() in seen_insights:
+                continue
+            seen_insights.add(text.lower())
+            if len(result["insights"]) < 40:
+                result["insights"].append(text)
+
+    # --- calculations: linhas tipo "Algo: R$ 1.234,56" ---
+    seen_calcs = set()
+    for m in RE_CALC_LINE.finditer(markdown):
+        desc = m.group(1).strip(" -*").strip()
+        val = m.group(2).strip()
+        if "dado não disponível" in desc.lower() or "dado não disponível" in val.lower():
+            continue
+        key = f"{desc}|{val}"
+        if key in seen_calcs:
+            continue
+        seen_calcs.add(key)
+        result["calculations"].append({"description": desc, "value": val, "formula": ""})
+        if len(result["calculations"]) >= 30:
+            break
+
+    # --- source_references: trechos pipe-delimitados ---
+    seen_refs = set()
+    for m in RE_EVIDENCE_PIPE.finditer(markdown):
+        full = m.group(0).strip()
+        reg = m.group(1).strip()
+        if full in seen_refs:
+            continue
+        seen_refs.add(full)
+        result["source_references"].append({
+            "registro": reg,
+            "excerpt": full[:400],
+            "relevance": "evidência SPED",
+        })
+        if len(result["source_references"]) >= 40:
+            break
+
+    # --- data_crossings: parágrafos que mencionam 2+ registros SPED distintos ---
+    paragraphs = re.split(r"\n\s*\n", markdown)
+    seen_cross = set()
+    for p in paragraphs:
+        regs = set(re.findall(r"\b([A-Z]\d{3})\b", p))
+        regs |= set(re.findall(r"\|([0-9A-Z]{4})\|", p))
+        if len(regs) >= 2 and len(p) < 1500:
+            short = p.strip().replace("\n", " ")
+            short_key = short[:120]
+            if short_key in seen_cross:
+                continue
+            seen_cross.add(short_key)
+            result["data_crossings"].append({
+                "description": short[:600],
+                "sources": sorted(regs),
+                "result": "",
+            })
+            if len(result["data_crossings"]) >= 20:
+                break
+
+    return result
+
+
+# -------------------------------
 # PROCESS SUMMARY JOB
 # -------------------------------
 def process_summary_job(job_id: str, req: SummaryRequest):
+    t_summary_start = time.time()
     try:
         job_update(job_id, status="processing", stage="starting")
         print(f"[SUMMARY][{job_id}] 🚀 START")
 
         mode = "strategic" if "DOCUMENTO 1" in req.template else "audit"
-        print(f"[SUMMARY][{job_id}] Mode: {mode}")
+        is_completa = _is_analise_completa(req.template)
+        print(f"[SUMMARY][{job_id}] Mode: {mode} | AnaliseCompleta: {is_completa}")
+
+        total_tokens_used = 0
+        prompt_tokens = 0
+        completion_tokens = 0
 
         if mode == "audit":
             job_update(job_id, stage="retrieving_context")
-            context = get_context(req.query, req.project_id, req.k)
-            print(f"[SUMMARY][{job_id}] Context size: {len(context)}")
-            context = context[:12000]
+            # 🆕 #1 — k adaptativo: 30 para análise completa, k da req para resto
+            effective_k = 30 if is_completa else (req.k or 10)
+            context = get_context(req.query, req.project_id, effective_k)
+            print(f"[SUMMARY][{job_id}] Context size: {len(context)} (k={effective_k})")
+            context = context[:14000 if is_completa else 12000]
+
+            # 🆕 #5 — extrai período direto do vector store p/ injetar no prompt
+            try:
+                vs = get_vector_store(req.project_id)
+                periodo_docs = vs.max_marginal_relevance_search(
+                    "0000 abertura período DT_INI DT_FIN CNPJ", k=6, fetch_k=20
+                )
+                periodo = extract_periodo_from_docs(periodo_docs)
+                print(f"[SUMMARY][{job_id}] Período extraído: {periodo}")
+            except Exception as e:
+                print(f"[SUMMARY][{job_id}] ⚠️ falha extraindo período: {e}")
+                periodo = None
 
             job_update(job_id, stage="building_prompt")
-            prompt = build_prompt(req.template, context, req.enrichment)
+            prompt = build_prompt(req.template, context, req.enrichment, periodo)
             print(f"[SUMMARY][{job_id}] Prompt size: {len(prompt)}")
 
             job_update(job_id, stage="llm_call")
-            response = llm.invoke(prompt)
+            with get_openai_callback() as cb:
+                response = llm.invoke(prompt)
+                total_tokens_used = cb.total_tokens
+                prompt_tokens = cb.prompt_tokens
+                completion_tokens = cb.completion_tokens
 
-            job_update(job_id, status="completed", stage="done",
-                       result={"mode": mode, "content": response.content})
+            generation_time_ms = int((time.time() - t_summary_start) * 1000)
+            content_str = response.content
+            structured = parse_summary_markdown(content_str)
+
+            job_update(
+                job_id, status="completed", stage="done",
+                result={
+                    "mode": mode,
+                    "content": content_str,
+                    # 🆕 #2 — metadados de geração
+                    "model": LLM_MODEL,
+                    "model_used": LLM_MODEL,
+                    "tokens_used": total_tokens_used,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "generation_time_ms": generation_time_ms,
+                    "periodo_detectado": periodo,
+                    # 🆕 #4 — campos estruturados extraídos
+                    "insights": structured["insights"],
+                    "calculations": structured["calculations"],
+                    "data_crossings": structured["data_crossings"],
+                    "source_references": structured["source_references"],
+                },
+            )
 
         else:
             job_update(job_id, stage="multi_step_rag")
             vector_store = get_vector_store(req.project_id)
 
-            docs = multi_query_retrieval(vector_store, req.query, per_query_k=8)
-            print(f"[SUMMARY][{job_id}] Docs após multi-query: {len(docs)}")
+            # 🆕 #1 — per_query_k adaptativo
+            per_q_k = 12 if is_completa else 8
+            docs = multi_query_retrieval(
+                vector_store, req.query,
+                per_query_k=per_q_k,
+                template=req.template,
+            )
+            print(f"[SUMMARY][{job_id}] Docs após multi-query: {len(docs)} (per_q_k={per_q_k})")
 
             if not docs:
                 print(f"[SUMMARY][{job_id}] ⚠️ multi-query vazio, fallback simples")
                 docs = vector_store.max_marginal_relevance_search(
-                    req.query, k=20, fetch_k=40
+                    req.query, k=30 if is_completa else 20, fetch_k=60
                 )
 
             log_registro_distribution(job_id, docs, "pré-cap")
@@ -614,51 +917,68 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             print(f"[SUMMARY][{job_id}] 0450 descartados: {dropped}")
             log_registro_distribution(job_id, docs, "pós-cap")
 
+            # 🆕 #5 — extrai período dos próprios docs recuperados (ou via query dedicada)
+            periodo = extract_periodo_from_docs(docs)
+            if not periodo:
+                try:
+                    extra = vector_store.max_marginal_relevance_search(
+                        "0000 abertura período DT_INI DT_FIN", k=6, fetch_k=20
+                    )
+                    periodo = extract_periodo_from_docs(extra)
+                except Exception:
+                    periodo = None
+            print(f"[SUMMARY][{job_id}] Período extraído: {periodo}")
+
             for i, doc in enumerate(docs, start=1):
                 src = doc.metadata.get("source", "?")
                 reg = doc.metadata.get("registro") or primary_registro(doc.page_content) or "?"
                 print(f"[SUMMARY][{job_id}] Doc {i}/{len(docs)} reg={reg} source={src}")
 
             partial_results = []
-            for i, doc in enumerate(docs):
-                reg = doc.metadata.get("registro") or primary_registro(doc.page_content) or "?"
-                prompt = f"""
-                Extraia APENAS dados REAIS do texto.
-                Registro SPED predominante: {reg}
+            with get_openai_callback() as cb_extract:
+                for i, doc in enumerate(docs):
+                    reg = doc.metadata.get("registro") or primary_registro(doc.page_content) or "?"
+                    prompt = f"""
+                    Extraia APENAS dados REAIS do texto.
+                    Registro SPED predominante: {reg}
 
-                RETORNE JSON:
-                {{
-                "evidencias": [
+                    RETORNE JSON:
                     {{
-                      "documento": "{doc.metadata.get("source")}",
-                      "chunk": "{doc.metadata.get("chunk_index")}",
-                      "registro": "{reg}",
-                      "trecho": "",
-                      "tipo": "financeiro | inconsistencia | fiscal | cadastral"
+                    "evidencias": [
+                        {{
+                          "documento": "{doc.metadata.get("source")}",
+                          "chunk": "{doc.metadata.get("chunk_index")}",
+                          "registro": "{reg}",
+                          "trecho": "",
+                          "tipo": "financeiro | inconsistencia | fiscal | cadastral"
+                        }}
+                      ]
                     }}
-                  ]
-                }}
 
-                REGRAS:
-                - NÃO inventar nada
-                - NÃO resumir
-                - NÃO estimar valores
-                - Se o registro for 0450 (informação complementar), marque tipo="cadastral"
-                  e NÃO o trate como evidência financeira.
-                - Se não houver evidência → retornar lista vazia
+                    REGRAS:
+                    - NÃO inventar nada
+                    - NÃO resumir
+                    - NÃO estimar valores
+                    - Se o registro for 0450 (informação complementar), marque tipo="cadastral"
+                      e NÃO o trate como evidência financeira.
+                    - Se não houver evidência → retornar lista vazia
 
-                TEXTO:
-                {doc.page_content}
-                """
-                try:
-                    res = llm.invoke(prompt)
-                    content = res.content.strip()
-                    if content and "evidencias" in content:
-                        partial_results.append((content, doc))
-                except Exception as e:
-                    print(f"[SUMMARY][{job_id}] erro doc {i}: {str(e)}")
+                    TEXTO:
+                    {doc.page_content}
+                    """
+                    try:
+                        res = llm.invoke(prompt)
+                        content = res.content.strip()
+                        if content and "evidencias" in content:
+                            partial_results.append((content, doc))
+                    except Exception as e:
+                        print(f"[SUMMARY][{job_id}] erro doc {i}: {str(e)}")
 
-            print(f"[SUMMARY][{job_id}] válidos: {len(partial_results)}")
+                total_tokens_used += cb_extract.total_tokens
+                prompt_tokens += cb_extract.prompt_tokens
+                completion_tokens += cb_extract.completion_tokens
+
+            print(f"[SUMMARY][{job_id}] válidos: {len(partial_results)} | tokens extração={cb_extract.total_tokens}")
             if not partial_results:
                 raise Exception("Nenhuma evidência encontrada")
 
@@ -696,8 +1016,10 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                     raise Exception("Nenhuma resposta útil retornada pelo LLM")
                 filtered_results = fallback
 
-            aggregated = "\n\n".join(filtered_results)[:20000]
-            print(f"[SUMMARY][{job_id}] Aggregated size: {len(aggregated)}")
+            # 🆕 #1 — agregado maior para análise completa
+            agg_limit = 26000 if is_completa else 20000
+            aggregated = "\n\n".join(filtered_results)[:agg_limit]
+            print(f"[SUMMARY][{job_id}] Aggregated size: {len(aggregated)} (limit={agg_limit})")
 
             enrichment_block = ""
             if req.enrichment:
@@ -708,9 +1030,19 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             {req.enrichment}
             """
 
+            # 🆕 #5 — bloco de período fixo
+            periodo_block = ""
+            if periodo:
+                periodo_block = f"""
+            ====================
+            PERÍODO ANALISADO (extraído do registro 0000)
+            ====================
+            {periodo}
+            """
+
             final_prompt = f"""
             {req.template}
-
+            {periodo_block}
             ====================
             BASE DE EVIDÊNCIAS
             ====================
@@ -734,15 +1066,47 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                cálculo de impacto financeiro ou ROI — esses cálculos devem vir de
                M100/M200/M500/M600 e itens C170. Se faltar essa base, declare ausência
                explicitamente em vez de citar 0450.
+            8. Sempre que mencionar o período da análise, use exatamente o período informado
+               no bloco "PERÍODO ANALISADO" acima. Só escreva "Dado não disponível" para
+               período se aquele bloco estiver ausente.
             """
 
             job_update(job_id, stage="final_llm")
-            final = llm.invoke(final_prompt)
+            with get_openai_callback() as cb_final:
+                final = llm.invoke(final_prompt)
+                total_tokens_used += cb_final.total_tokens
+                prompt_tokens += cb_final.prompt_tokens
+                completion_tokens += cb_final.completion_tokens
 
-            job_update(job_id, status="completed", stage="done",
-                       result={"mode": mode, "content": final.content})
+            generation_time_ms = int((time.time() - t_summary_start) * 1000)
+            content_str = final.content
 
-        print(f"[SUMMARY][{job_id}] ✅ DONE")
+            # 🆕 #4 — parse estrutural
+            structured = parse_summary_markdown(content_str)
+
+            job_update(
+                job_id, status="completed", stage="done",
+                result={
+                    "mode": mode,
+                    "content": content_str,
+                    # 🆕 #2 — metadados de geração (top-level)
+                    "model": LLM_MODEL,
+                    "model_used": LLM_MODEL,
+                    "tokens_used": total_tokens_used,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "generation_time_ms": generation_time_ms,
+                    "periodo_detectado": periodo,
+                    # 🆕 #4 — campos estruturados
+                    "insights": structured["insights"],
+                    "calculations": structured["calculations"],
+                    "data_crossings": structured["data_crossings"],
+                    "source_references": structured["source_references"],
+                    "sources_used": len(docs),
+                },
+            )
+
+        print(f"[SUMMARY][{job_id}] ✅ DONE | tokens_total={total_tokens_used} | {generation_time_ms}ms")
 
     except Exception as e:
         print(f"[SUMMARY][{job_id}] ❌ ERROR")
@@ -799,7 +1163,8 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
 
         async def process_single_file(file: UploadFile):
             content = await file.read()
-            text = content.decode("utf-8", errors="ignore")
+            # 🆕 #3 — decoder inteligente
+            text = smart_decode_sped(content)
             if text.strip():
                 return {"filename": file.filename, "text": text}
             return None
@@ -817,12 +1182,13 @@ async def upload_documents(project_id: str, files: List[UploadFile] = File(...))
 
 
 # -------------------------------
-# ⚡ NOVO: /process-paths — backend baixa direto do Storage
+# ⚡ /process-paths — backend baixa direto do Storage
 # -------------------------------
 def _download_file(path: str) -> Optional[dict]:
     try:
         data = supabase.storage.from_(BUCKET_NAME).download(path)
-        text = data.decode("utf-8", errors="ignore")
+        # 🆕 #3 — decoder inteligente (preserva acentos do SPED em latin-1/cp1252)
+        text = smart_decode_sped(data)
         if not text.strip():
             return None
         filename = path.split("/")[-1]
@@ -845,7 +1211,6 @@ def process_paths(req: ProcessPathsRequest):
             try:
                 job_update(job_id, status="processing", stage="downloading", progress=1)
                 t0 = time.time()
-                # ⚡ Download paralelo (16 threads) usando SUPABASE_SERVICE_KEY
                 with ThreadPoolExecutor(max_workers=16) as ex:
                     results = list(ex.map(_download_file, req.paths))
                 files_data = [r for r in results if r is not None]
