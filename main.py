@@ -180,6 +180,16 @@ EMBED_MODEL = "text-embedding-3-small"
 EMBED_BATCH = 256
 LLM_MODEL = "gpt-4.1"
 
+# -------------------------------
+# AGENTIC RAG CONFIG
+# -------------------------------
+AGENTIC_MAX_ITERATIONS = 15           # nº máximo de "passos" do agente (search/think/write)
+AGENTIC_MAX_SEARCHES = 12             # nº máximo de buscas distintas no Chroma
+AGENTIC_DEFAULT_K = 10                # k default por busca quando agente não especifica
+AGENTIC_MAX_K = 25                    # teto de k por busca
+AGENTIC_MAX_CHUNK_CHARS = 1800        # corte por chunk antes de devolver para o LLM
+AGENTIC_TOOL_TIMEOUT_S = 30           # timeout por chamada ao Chroma
+
 
 class BatchOpenAIEmbeddings(Embeddings):
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
@@ -315,7 +325,7 @@ def cap_registro_chunks(docs, registro: str, max_keep: int):
 
 
 # -------------------------------
-# DRIVA PRE-PROCESSING (extrai apenas campos fiscalmente relevantes)
+# DRIVA PRE-PROCESSING
 # -------------------------------
 DRIVA_RELEVANT_KEYS = {
     "cnpj", "razao_social", "nome_fantasia", "natureza_juridica",
@@ -332,7 +342,6 @@ DRIVA_RELEVANT_KEYS = {
 
 
 def _filter_driva_dict(data: Any, depth: int = 0) -> Any:
-    """Mantém apenas chaves relevantes para análise fiscal. Limita profundidade."""
     if depth > 6:
         return None
     if isinstance(data, dict):
@@ -345,7 +354,6 @@ def _filter_driva_dict(data: Any, depth: int = 0) -> Any:
                     out[k] = filtered
         return out
     if isinstance(data, list):
-        # limita listas grandes (ex.: histórico de sócios) aos 10 primeiros itens relevantes
         out_list = []
         for item in data[:10]:
             filtered = _filter_driva_dict(item, depth + 1)
@@ -356,7 +364,6 @@ def _filter_driva_dict(data: Any, depth: int = 0) -> Any:
 
 
 def preprocess_driva(enrichment: Dict) -> Dict:
-    """Reduz o JSON Driva ao essencial antes de indexar/injetar."""
     if not isinstance(enrichment, dict):
         return {}
     filtered = _filter_driva_dict(enrichment)
@@ -364,7 +371,7 @@ def preprocess_driva(enrichment: Dict) -> Dict:
 
 
 # -------------------------------
-# RAG HELPERS
+# RAG FILTERS / HELPERS (one-shot legados)
 # -------------------------------
 def _filter_sped() -> Dict:
     return {"source_kind": "sped"}
@@ -375,17 +382,13 @@ def _filter_driva() -> Dict:
 
 
 def get_context(query: str, project_id: str, k: int = 10):
-    """Audit mode: retorna contexto SEPARADO (SPED + Driva)."""
     try:
         vector_store = get_vector_store(project_id)
-
-        # SPED principal
         try:
             sped_docs = vector_store.max_marginal_relevance_search(
                 query, k=k, fetch_k=k * 4, filter=_filter_sped()
             )
         except Exception:
-            # fallback se filtro não funcionar (chunks antigos sem source_kind)
             sped_docs = vector_store.max_marginal_relevance_search(query, k=k, fetch_k=k * 4)
 
         if not sped_docs:
@@ -402,7 +405,6 @@ def get_context(query: str, project_id: str, k: int = 10):
                 f"[SPED] Fonte: {doc.metadata.get('source')} | Chunk: {doc.metadata.get('chunk_index')} | Registro: {reg}\n{doc.page_content}"
             )
 
-        # Driva (contexto secundário, k pequeno)
         driva_parts = []
         try:
             driva_docs = vector_store.max_marginal_relevance_search(
@@ -425,7 +427,6 @@ def get_context(query: str, project_id: str, k: int = 10):
 
 
 def driva_context_retrieval(vector_store, k: int = 5) -> List[Any]:
-    """Recupera chunks Driva como contexto de negócio (separado)."""
     try:
         return vector_store.max_marginal_relevance_search(
             "porte regime tributário CNAE atividade sócios capital situação cadastral",
@@ -434,55 +435,6 @@ def driva_context_retrieval(vector_store, k: int = 5) -> List[Any]:
     except Exception as e:
         print(f"[driva_context_retrieval] falhou: {e}")
         return []
-
-
-def build_prompt(template: str, context: str, periodo: Optional[str] = None):
-    periodo_block = ""
-    if periodo:
-        periodo_block = f"\n====================\nPERÍODO ANALISADO (extraído do registro 0000)\n====================\n{periodo}\n"
-
-    return f"""
-Você é um auditor fiscal especialista em SPED (EFD PIS/COFINS).
-
-Sua função é identificar inconsistências reais, validar cálculos e garantir integridade dos dados.
-{periodo_block}
-====================
-CONTEXTO
-====================
-{context}
-
-====================
-INSTRUÇÕES
-====================
-{template}
-
-====================
-REGRAS DE AUDITORIA (OBRIGATÓRIAS)
-====================
-1. NÃO gere descrições genéricas.
-2. Sempre validar consistência entre registros (A100 vs A170, totais vs itens, valores divergentes).
-3. Verificar base de cálculo, alíquota, valor do tributo.
-4. Identificar erros: divergência total/itens, valores duplicados, CST incompatível, campos zerados.
-5. Quando NÃO houver erro: "Nenhuma inconsistência relevante encontrada".
-6. Toda análise deve conter evidência (trecho real), explicação técnica e lógica aplicada.
-7. Se fizer cálculo: mostrar fórmula, valores usados e resultado.
-8. NÃO use o registro 0450 como evidência principal de análise financeira.
-   Priorize blocos com valores: M100, M200, M500, M600 (apuração) e C100, C170, C190, C500, D100.
-9. Ao numerar seções, substitua qualquer placeholder `X.N` pelo número real do capítulo.
-10. Se um item realmente não tiver dado, escreva "Dado não disponível nos arquivos analisados" SOMENTE uma vez por seção.
-11. Sempre que mencionar o período, use exatamente o período informado no bloco "PERÍODO ANALISADO".
-12. SEPARAÇÃO DE FONTES (CRÍTICO):
-    - Toda afirmação numérica/fiscal/contábil DEVE vir de [SPED].
-    - Dados [DRIVA] servem APENAS para qualificar porte, setor, regime tributário presumido,
-      situação cadastral, sócios. NUNCA cite Driva como evidência de cálculo, base ou tributo.
-
-{{
-  "insights": [{{"titulo": "", "explicacao": "", "passo_a_passo": [], "dados_utilizados": [], "logica_aplicada": "", "conclusao": ""}}],
-  "inconsistencias": [{{"titulo": "", "descricao": "", "impacto": "", "evidencias": [{{"fonte": "", "trecho": ""}}], "recomendacao": ""}}],
-  "analises": [],
-  "referencias": []
-}}
-"""
 
 
 # -------------------------------
@@ -494,6 +446,8 @@ class SummaryRequest(BaseModel):
     enrichment: Optional[Dict] = None  # DEPRECATED: indexar via /enrichment
     k: Optional[int] = 20
     project_id: str
+    # 🆕 modo agêntico: se True, usa loop tool-calling em vez de one-shot RAG
+    agentic: Optional[bool] = True
 
 
 class EnrichmentRequest(BaseModel):
@@ -508,7 +462,7 @@ class ProcessPathsRequest(BaseModel):
 
 
 # -------------------------------
-# PROCESS JOB (SPED)
+# PROCESS JOB (SPED) — indexação
 # -------------------------------
 def process_job(job_id: str, files_data: List[dict], project_id: str):
     try:
@@ -530,7 +484,7 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
                 all_chunks.append(chunk)
                 all_metadata.append({
                     "source": filename,
-                    "source_kind": "sped",  # 🆕 namespace
+                    "source_kind": "sped",
                     "chunk_index": idx,
                     "project_id": project_id,
                     "type": "document",
@@ -572,94 +526,181 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
 
 
 # -------------------------------
-# Multi-query retrieval (SPED apenas)
+# Helpers de inspeção do projeto (para o agente)
 # -------------------------------
-APURACAO_QUERIES = [
-    "M100 M105 base de cálculo crédito PIS valor alíquota",
-    "M200 M205 M210 apuração contribuição PIS COFINS valor devido",
-    "M500 M505 M600 M605 M610 crédito COFINS débito apuração",
-    "E110 E116 apuração ICMS débitos créditos saldo",
-    "E520 E530 apuração IPI período",
-]
-FISCAIS_QUERIES = [
-    "C100 nota fiscal valor total operação ICMS",
-    "C170 item nota fiscal NCM CST CFOP valor unitário",
-    "C190 C500 D100 análise consolidada itens",
-]
-CADASTRAIS_QUERIES = [
-    "0000 abertura arquivo período empresa CNPJ",
-    "0150 participantes fornecedores clientes",
-    "0200 0220 itens produtos serviços fatores conversão",
-    "totais consolidados ajustes créditos do período",
-    "inconsistências divergências entre totais e itens valores zerados",
-]
-
-
-def _is_analise_completa(template: str) -> bool:
-    if not template:
-        return False
-    t = template.lower()
-    keywords = ["análise completa", "analise completa", "relatório executivo estratégico",
-                "documento 1", "consolidação final", "consolidacao final"]
-    return any(kw in t for kw in keywords)
-
-
-def multi_query_retrieval(vector_store, base_query: str, per_query_k: int = 8, template: str = "") -> List[Any]:
-    """Multi-step SPED-only retrieval."""
-    analise_completa = _is_analise_completa(template)
-
-    if analise_completa:
-        steps: List[Tuple[List[str], int, str]] = [
-            (APURACAO_QUERIES, max(per_query_k, 10), "APURACAO"),
-            (FISCAIS_QUERIES, max(per_query_k, 8), "FISCAIS"),
-            (CADASTRAIS_QUERIES, max(per_query_k // 2, 4), "CADASTRAIS"),
-        ]
-        steps[0] = ([base_query] + steps[0][0], steps[0][1], steps[0][2])
-    else:
-        legacy_queries = [base_query] + APURACAO_QUERIES[:2] + FISCAIS_QUERIES[:2] + CADASTRAIS_QUERIES[3:]
-        steps = [(legacy_queries, per_query_k, "LEGACY")]
-
-    seen, merged = set(), []
-    for queries, k_step, label in steps:
-        before = len(merged)
-        for q in queries:
-            try:
-                # 🆕 filtro source_kind=sped
-                docs = vector_store.max_marginal_relevance_search(
-                    q, k=k_step, fetch_k=k_step * 3, filter=_filter_sped(),
-                )
-            except Exception as e:
-                # fallback p/ chunks antigos sem source_kind
-                print(f"[multi_query][{label}] filtro sped falhou ({e}), tentando sem filtro")
-                try:
-                    docs = vector_store.max_marginal_relevance_search(
-                        q, k=k_step, fetch_k=k_step * 3, filter={"type": "document"},
-                    )
-                except Exception as e2:
-                    print(f"[multi_query][{label}] query={q[:40]!r} falhou: {e2}")
-                    continue
-            for d in docs:
-                key = (d.metadata.get("source"), d.metadata.get("chunk_index"))
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged.append(d)
-        print(f"[multi_query][{label}] +{len(merged)-before} novos (total={len(merged)})")
-    return merged
-
-
-def log_registro_distribution(job_id: str, docs, label: str):
-    dist = Counter()
-    for d in docs:
-        reg = d.metadata.get("registro") or primary_registro(d.page_content) or "unknown"
-        dist[reg] += 1
-    pretty = ", ".join(f"{k}={v}" for k, v in dist.most_common())
-    print(f"[SUMMARY][{job_id}] DIST {label}: total={len(docs)} | {pretty}")
-    return dist
+def list_project_sources(project_id: str) -> Dict[str, Any]:
+    """Lista arquivos/fontes e registros disponíveis (visão geral para o agente decidir buscas)."""
+    try:
+        vs = get_vector_store(project_id)
+        # cobertura aproximada: amostra de docs via similarity ampla
+        sample = vs.max_marginal_relevance_search("0000 0150 0200 M100 M200 C100", k=60, fetch_k=200)
+    except Exception as e:
+        return {"error": str(e), "sources": [], "registros": {}}
+    sources = Counter()
+    regs = Counter()
+    kinds = Counter()
+    for d in sample:
+        sources[d.metadata.get("source", "?")] += 1
+        regs[d.metadata.get("registro") or primary_registro(d.page_content) or "?"] += 1
+        kinds[d.metadata.get("source_kind", "?")] += 1
+    return {
+        "sources": [{"name": k, "chunks_sample": v} for k, v in sources.most_common(20)],
+        "registros": dict(regs.most_common(30)),
+        "source_kinds": dict(kinds),
+        "note": "Amostragem aproximada (top 60 chunks). Use search_sped/search_driva para buscas dirigidas.",
+    }
 
 
 # -------------------------------
-# POS-PROCESSAMENTO ESTRUTURAL
+# AGENTIC TOOLS — execução real das buscas
+# -------------------------------
+def _doc_to_payload(d: Any, max_chars: int = AGENTIC_MAX_CHUNK_CHARS) -> Dict[str, Any]:
+    content = (d.page_content or "")[:max_chars]
+    reg = d.metadata.get("registro") or primary_registro(d.page_content) or "?"
+    return {
+        "source": d.metadata.get("source", "?"),
+        "chunk_index": d.metadata.get("chunk_index"),
+        "registro": reg,
+        "source_kind": d.metadata.get("source_kind", "?"),
+        "text": content,
+    }
+
+
+def tool_search_sped(project_id: str, query: str, k: int = AGENTIC_DEFAULT_K, registro: Optional[str] = None) -> Dict[str, Any]:
+    k = max(1, min(int(k or AGENTIC_DEFAULT_K), AGENTIC_MAX_K))
+    vs = get_vector_store(project_id)
+    flt: Dict[str, Any] = {"source_kind": "sped"}
+    if registro:
+        flt["registro"] = registro
+    try:
+        docs = vs.max_marginal_relevance_search(query, k=k, fetch_k=k * 3, filter=flt)
+    except Exception as e:
+        # fallback sem filtro
+        try:
+            docs = vs.max_marginal_relevance_search(query, k=k, fetch_k=k * 3)
+        except Exception as e2:
+            return {"error": f"search_sped falhou: {e2}", "results": []}
+    # aplica cap 0450
+    docs, dropped = cap_registro_chunks(docs, "0450", MAX_0450_CHUNKS)
+    return {
+        "query": query,
+        "k": k,
+        "registro_filter": registro,
+        "dropped_0450": dropped,
+        "results": [_doc_to_payload(d) for d in docs],
+    }
+
+
+def tool_search_driva(project_id: str, query: str, k: int = 5) -> Dict[str, Any]:
+    k = max(1, min(int(k or 5), 10))
+    vs = get_vector_store(project_id)
+    try:
+        docs = vs.max_marginal_relevance_search(query, k=k, fetch_k=k * 3, filter=_filter_driva())
+    except Exception as e:
+        return {"error": f"search_driva falhou: {e}", "results": []}
+    return {"query": query, "k": k, "results": [_doc_to_payload(d) for d in docs]}
+
+
+def tool_get_periodo(project_id: str) -> Dict[str, Any]:
+    vs = get_vector_store(project_id)
+    try:
+        docs = vs.max_marginal_relevance_search(
+            "0000 abertura período DT_INI DT_FIN CNPJ", k=6, fetch_k=20, filter=_filter_sped()
+        )
+    except Exception:
+        docs = vs.max_marginal_relevance_search("0000 abertura período DT_INI DT_FIN CNPJ", k=6, fetch_k=20)
+    periodo = extract_periodo_from_docs(docs)
+    return {"periodo": periodo}
+
+
+def tool_list_sources(project_id: str) -> Dict[str, Any]:
+    return list_project_sources(project_id)
+
+
+# Schema das tools para o OpenAI tool-calling
+AGENTIC_TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_sources",
+            "description": (
+                "Lista arquivos SPED disponíveis no projeto e os registros (ex: M100, C170, 0000) "
+                "mais frequentes. Use no início para entender o que existe antes de buscar."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_periodo",
+            "description": "Retorna o período fiscal analisado (DT_INI / DT_FIN do registro 0000).",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_sped",
+            "description": (
+                "Busca semântica em chunks SPED do projeto. Use perguntas específicas (ex: "
+                "'créditos PIS sobre devoluções M100', 'apuração ICMS E110', 'itens nota fiscal C170 CFOP'). "
+                "Filtre por registro quando souber (ex: 'M200', 'C100')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Pergunta ou termos de busca."},
+                    "k": {"type": "integer", "description": f"Nº de chunks (1..{AGENTIC_MAX_K}). Default {AGENTIC_DEFAULT_K}."},
+                    "registro": {"type": "string", "description": "Registro SPED para filtrar (ex: M100, C170, E110)."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_driva",
+            "description": (
+                "Busca contexto de negócio (Driva): porte, CNAE, regime tributário, sócios, situação cadastral. "
+                "NUNCA use como evidência numérica/fiscal — apenas para qualificar a empresa."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "k": {"type": "integer", "description": "1..10. Default 5."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish",
+            "description": (
+                "Encerre o loop e produza o SUMÁRIO FINAL completo em Markdown, obedecendo o template. "
+                "Chame esta tool quando tiver evidências suficientes (ou quando ficar claro que não há dados)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "markdown": {
+                        "type": "string",
+                        "description": "Sumário final em Markdown, com todas as seções do template preenchidas.",
+                    }
+                },
+                "required": ["markdown"],
+            },
+        },
+    },
+]
+
+
+# -------------------------------
+# POS-PROCESSAMENTO (parse markdown -> structured)
 # -------------------------------
 RE_CALC_LINE = re.compile(r"([A-Z][^=:]{3,60})\s*[:=]\s*(R\$\s?[\d\.,]+|\d[\d\.,]*)\s*(.*)")
 RE_EVIDENCE_PIPE = re.compile(r"\|\s*([0-9A-Z]{4})\s*\|[^|\n]{2,200}\|")
@@ -749,286 +790,340 @@ def parse_summary_markdown(markdown: str) -> Dict[str, List[Any]]:
 
 
 # -------------------------------
-# Driva context block (string formatada para prompt)
+# AGENTIC SYSTEM PROMPT
 # -------------------------------
-def build_driva_block(driva_docs: List[Any]) -> str:
-    if not driva_docs:
-        return ""
-    parts = []
-    for d in driva_docs:
-        parts.append(
-            f"[DRIVA] Fonte: {d.metadata.get('source', 'driva')} | Chunk: {d.metadata.get('chunk_index')}\n{d.page_content}"
-        )
-    return (
-        "\n\n====================\n"
-        "CONTEXTO DE NEGÓCIO (Driva) — apoio, NÃO usar como evidência numérica\n"
-        "====================\n"
-        + "\n\n".join(parts)
-    )
+AGENTIC_SYSTEM_PROMPT = """\
+Você é um AGENTE auditor fiscal especialista em SPED (EFD PIS/COFINS, ICMS/IPI).
+Sua missão: produzir um sumário fiscal de altíssima qualidade obedecendo ESTRITAMENTE o template do usuário.
+
+Você NÃO recebe os documentos de antemão. Você precisa BUSCÁ-LOS sob demanda usando as ferramentas (tools):
+- list_sources: visão geral dos arquivos e registros disponíveis no projeto.
+- get_periodo: período fiscal (DT_INI/DT_FIN do 0000).
+- search_sped(query, k, registro?): busca semântica nos chunks SPED. Use perguntas DIFERENTES para cobrir cada seção do template.
+- search_driva(query, k): contexto de negócio (porte, CNAE, regime, sócios). NUNCA como evidência numérica.
+- finish(markdown): encerra e entrega o sumário final em Markdown.
+
+ESTRATÉGIA OBRIGATÓRIA:
+1. Comece com list_sources e get_periodo para entender o que existe.
+2. Para CADA seção/oportunidade do template, faça pelo menos UMA busca dirigida em search_sped.
+   - Ex: "M200 apuração contribuição PIS COFINS valor devido", "C170 itens NCM CST CFOP", "E110 apuração ICMS".
+   - Se a primeira busca não trouxer evidência, REFINE a query (sinônimos, código do registro) antes de desistir.
+3. Faça no máximo {max_searches} buscas. Não repita queries idênticas.
+4. Se NÃO encontrar evidência real para um item:
+   - NÃO invente números.
+   - NÃO escreva "Dado não disponível" repetidamente — OMITA a linha/coluna/oportunidade,
+     ou agrupe num bloco curto "Itens sem evidência nos arquivos analisados".
+5. Toda afirmação numérica/fiscal DEVE citar a fonte SPED (arquivo + registro + trecho literal).
+6. Driva pode contextualizar porte/CNAE/regime, mas NUNCA gerar cálculo.
+7. Registro 0450 é informação complementar — não use como base de impacto/ROI.
+8. Substitua qualquer placeholder "X.N" pelo número real do capítulo.
+9. Sempre que mencionar período, use exatamente o retornado por get_periodo.
+10. Quando tiver evidências suficientes (ou ficar claro que não há mais o que buscar), chame finish(markdown=...).
+
+FORMATO DO SUMÁRIO FINAL:
+- Markdown bem estruturado, com títulos hierárquicos.
+- Tabelas só quando houver dados reais para preencher todas as colunas relevantes.
+- Cite trechos SPED entre aspas ou em blockquote, indicando arquivo e registro.
+"""
+
+
+def _run_agentic_summary(req: SummaryRequest, job_id: str) -> Dict[str, Any]:
+    """
+    Loop agêntico:
+      - Modelo recebe template + tools.
+      - Faz buscas iterativas no Chroma via tool calls.
+      - Encerra com finish(markdown).
+    """
+    project_id = req.project_id
+    template = req.template
+
+    # Mensagem inicial
+    system_msg = AGENTIC_SYSTEM_PROMPT.format(max_searches=AGENTIC_MAX_SEARCHES)
+    user_msg = f"""\
+TEMPLATE DO USUÁRIO (instruções de conteúdo e formato do sumário):
+\"\"\"
+{template}
+\"\"\"
+
+OBJETIVO INICIAL: {req.query or "gerar sumário geral"}
+PROJECT_ID: {project_id}
+
+Inicie pela exploração (list_sources / get_periodo), depois faça buscas dirigidas para CADA seção do template.
+Quando tiver evidências suficientes, chame finish(markdown=...).
+"""
+
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ]
+
+    total_searches = 0
+    total_tool_calls = 0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    final_markdown: Optional[str] = None
+    trace: List[Dict[str, Any]] = []
+
+    for step in range(AGENTIC_MAX_ITERATIONS):
+        job_update(job_id, stage=f"agent_step_{step+1}")
+        try:
+            resp = openai_client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=messages,
+                tools=AGENTIC_TOOLS_SCHEMA,
+                tool_choice="auto",
+                temperature=0.1,
+            )
+        except Exception as e:
+            print(f"[AGENT][{job_id}] erro na chamada LLM step={step}: {e}")
+            raise
+
+        if resp.usage:
+            total_prompt_tokens += resp.usage.prompt_tokens or 0
+            total_completion_tokens += resp.usage.completion_tokens or 0
+
+        msg = resp.choices[0].message
+        # Anexa mensagem do assistente ao histórico
+        messages.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in (msg.tool_calls or [])
+            ] if msg.tool_calls else None,
+        })
+
+        if not msg.tool_calls:
+            # Modelo não chamou tool — pode ter respondido em texto.
+            # Se tiver conteúdo razoável, aceita como final.
+            if msg.content and len(msg.content.strip()) > 200:
+                final_markdown = msg.content
+                trace.append({"step": step, "action": "assistant_text_final"})
+                break
+            # Caso contrário, força encerramento
+            messages.append({
+                "role": "user",
+                "content": "Você não chamou nenhuma tool. Se já tem dados suficientes, chame finish(markdown=...). Caso contrário, faça mais buscas com search_sped.",
+            })
+            continue
+
+        # Executa cada tool call
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except Exception:
+                args = {}
+            total_tool_calls += 1
+            print(f"[AGENT][{job_id}] step={step+1} tool={name} args={str(args)[:200]}")
+
+            tool_result: Any
+            if name == "finish":
+                final_markdown = args.get("markdown") or ""
+                trace.append({"step": step, "action": "finish", "len": len(final_markdown)})
+                # Adiciona resposta da tool (obrigatório pelo protocolo)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps({"ok": True}),
+                })
+                break
+
+            if name == "list_sources":
+                tool_result = tool_list_sources(project_id)
+            elif name == "get_periodo":
+                tool_result = tool_get_periodo(project_id)
+            elif name == "search_sped":
+                if total_searches >= AGENTIC_MAX_SEARCHES:
+                    tool_result = {"error": f"Limite de buscas atingido ({AGENTIC_MAX_SEARCHES}). Chame finish."}
+                else:
+                    total_searches += 1
+                    tool_result = tool_search_sped(
+                        project_id,
+                        query=args.get("query", ""),
+                        k=args.get("k", AGENTIC_DEFAULT_K),
+                        registro=args.get("registro"),
+                    )
+            elif name == "search_driva":
+                tool_result = tool_search_driva(
+                    project_id, query=args.get("query", ""), k=args.get("k", 5),
+                )
+            else:
+                tool_result = {"error": f"tool desconhecida: {name}"}
+
+            trace.append({"step": step, "action": name, "args": args, "n_results": len(tool_result.get("results", [])) if isinstance(tool_result, dict) else None})
+
+            # Trunca payload se muito grande para não estourar contexto
+            payload_str = json.dumps(tool_result, ensure_ascii=False)
+            if len(payload_str) > 60000:
+                payload_str = payload_str[:60000] + ' ...[TRUNCATED]"}'
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": payload_str,
+            })
+
+        if final_markdown is not None:
+            break
+    else:
+        print(f"[AGENT][{job_id}] ⚠️ atingiu MAX_ITERATIONS={AGENTIC_MAX_ITERATIONS} sem finish")
+
+    if not final_markdown:
+        # Último recurso: pedir um fechamento explícito
+        messages.append({
+            "role": "user",
+            "content": "Encerre AGORA chamando finish(markdown=...) com o melhor sumário possível dado o que já buscou.",
+        })
+        try:
+            resp = openai_client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=messages,
+                tools=AGENTIC_TOOLS_SCHEMA,
+                tool_choice={"type": "function", "function": {"name": "finish"}},
+                temperature=0.1,
+            )
+            if resp.usage:
+                total_prompt_tokens += resp.usage.prompt_tokens or 0
+                total_completion_tokens += resp.usage.completion_tokens or 0
+            tcs = resp.choices[0].message.tool_calls or []
+            if tcs:
+                args = json.loads(tcs[0].function.arguments or "{}")
+                final_markdown = args.get("markdown") or ""
+        except Exception as e:
+            print(f"[AGENT][{job_id}] fallback finish falhou: {e}")
+
+    if not final_markdown:
+        raise Exception("Agente não produziu sumário final.")
+
+    return {
+        "markdown": final_markdown,
+        "prompt_tokens": total_prompt_tokens,
+        "completion_tokens": total_completion_tokens,
+        "total_tokens": total_prompt_tokens + total_completion_tokens,
+        "searches": total_searches,
+        "tool_calls": total_tool_calls,
+        "iterations": min(step + 1, AGENTIC_MAX_ITERATIONS),
+        "trace": trace,
+    }
 
 
 # -------------------------------
-# PROCESS SUMMARY JOB
+# PROCESS SUMMARY JOB (agentic-first, com fallback one-shot)
 # -------------------------------
 def process_summary_job(job_id: str, req: SummaryRequest):
     t_summary_start = time.time()
     try:
         job_update(job_id, status="processing", stage="starting")
-        print(f"[SUMMARY][{job_id}] 🚀 START")
+        print(f"[SUMMARY][{job_id}] 🚀 START | agentic={req.agentic}")
 
         if req.enrichment:
             print(f"[SUMMARY][{job_id}] ⚠️ enrichment no body está DEPRECATED — ignorando. Use /enrichment para indexar.")
 
-        mode = "strategic" if "DOCUMENTO 1" in req.template else "audit"
-        is_completa = _is_analise_completa(req.template)
-        print(f"[SUMMARY][{job_id}] Mode: {mode} | AnaliseCompleta: {is_completa}")
-
-        total_tokens_used = 0
-        prompt_tokens = 0
-        completion_tokens = 0
-
-        if mode == "audit":
-            job_update(job_id, stage="retrieving_context")
-            effective_k = 30 if is_completa else (req.k or 10)
-            context = get_context(req.query, req.project_id, effective_k)
-            print(f"[SUMMARY][{job_id}] Context size: {len(context)} (k={effective_k})")
-            context = context[:14000 if is_completa else 12000]
-
+        # ---- MODO AGÊNTICO (default) ----
+        if req.agentic:
             try:
-                vs = get_vector_store(req.project_id)
-                periodo_docs = vs.max_marginal_relevance_search(
-                    "0000 abertura período DT_INI DT_FIN CNPJ", k=6, fetch_k=20,
+                job_update(job_id, stage="agentic_rag")
+                agent_out = _run_agentic_summary(req, job_id)
+                content_str = agent_out["markdown"]
+                structured = parse_summary_markdown(content_str)
+                periodo = tool_get_periodo(req.project_id).get("periodo")
+                generation_time_ms = int((time.time() - t_summary_start) * 1000)
+
+                job_update(
+                    job_id, status="completed", stage="done",
+                    result={
+                        "mode": "agentic",
+                        "content": content_str,
+                        "model": LLM_MODEL, "model_used": LLM_MODEL,
+                        "tokens_used": agent_out["total_tokens"],
+                        "prompt_tokens": agent_out["prompt_tokens"],
+                        "completion_tokens": agent_out["completion_tokens"],
+                        "generation_time_ms": generation_time_ms,
+                        "periodo_detectado": periodo,
+                        "insights": structured["insights"],
+                        "calculations": structured["calculations"],
+                        "data_crossings": structured["data_crossings"],
+                        "source_references": structured["source_references"],
+                        "agent": {
+                            "iterations": agent_out["iterations"],
+                            "searches": agent_out["searches"],
+                            "tool_calls": agent_out["tool_calls"],
+                            "trace": agent_out["trace"],
+                        },
+                    },
                 )
-                periodo = extract_periodo_from_docs(periodo_docs)
-                print(f"[SUMMARY][{job_id}] Período extraído: {periodo}")
+                print(f"[SUMMARY][{job_id}] ✅ AGENTIC DONE | iters={agent_out['iterations']} | searches={agent_out['searches']} | tokens={agent_out['total_tokens']} | {generation_time_ms}ms")
+                return
             except Exception as e:
-                print(f"[SUMMARY][{job_id}] ⚠️ falha extraindo período: {e}")
-                periodo = None
+                print(f"[SUMMARY][{job_id}] ⚠️ agentic falhou ({e}); caindo para one-shot legado")
+                print(traceback.format_exc())
+                # Continua para modo legado abaixo
 
-            job_update(job_id, stage="building_prompt")
-            prompt = build_prompt(req.template, context, periodo)
-            print(f"[SUMMARY][{job_id}] Prompt size: {len(prompt)}")
+        # ---- MODO LEGADO (one-shot RAG) — fallback / req.agentic=False ----
+        mode = "strategic" if "DOCUMENTO 1" in req.template else "audit"
+        print(f"[SUMMARY][{job_id}] Mode legado: {mode}")
 
-            job_update(job_id, stage="llm_call")
-            with get_openai_callback() as cb:
-                response = llm.invoke(prompt)
-                total_tokens_used = cb.total_tokens
-                prompt_tokens = cb.prompt_tokens
-                completion_tokens = cb.completion_tokens
+        job_update(job_id, stage="retrieving_context")
+        effective_k = req.k or 10
+        context = get_context(req.query, req.project_id, effective_k)
+        context = context[:12000]
 
-            generation_time_ms = int((time.time() - t_summary_start) * 1000)
-            content_str = response.content
-            structured = parse_summary_markdown(content_str)
-
-            job_update(
-                job_id, status="completed", stage="done",
-                result={
-                    "mode": mode, "content": content_str,
-                    "model": LLM_MODEL, "model_used": LLM_MODEL,
-                    "tokens_used": total_tokens_used,
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "generation_time_ms": generation_time_ms,
-                    "periodo_detectado": periodo,
-                    "insights": structured["insights"],
-                    "calculations": structured["calculations"],
-                    "data_crossings": structured["data_crossings"],
-                    "source_references": structured["source_references"],
-                },
+        try:
+            vs = get_vector_store(req.project_id)
+            periodo_docs = vs.max_marginal_relevance_search(
+                "0000 abertura período DT_INI DT_FIN CNPJ", k=6, fetch_k=20,
             )
+            periodo = extract_periodo_from_docs(periodo_docs)
+        except Exception:
+            periodo = None
 
-        else:
-            job_update(job_id, stage="multi_step_rag")
-            vector_store = get_vector_store(req.project_id)
+        periodo_block = f"\nPERÍODO ANALISADO: {periodo}\n" if periodo else ""
+        prompt = f"""Você é um auditor fiscal especialista em SPED.
 
-            per_q_k = 12 if is_completa else 8
-            docs = multi_query_retrieval(vector_store, req.query, per_query_k=per_q_k, template=req.template)
-            print(f"[SUMMARY][{job_id}] Docs SPED após multi-query: {len(docs)} (per_q_k={per_q_k})")
+{periodo_block}
+CONTEXTO:
+{context}
 
-            if not docs:
-                print(f"[SUMMARY][{job_id}] ⚠️ multi-query vazio, fallback")
-                docs = vector_store.max_marginal_relevance_search(
-                    req.query, k=30 if is_completa else 20, fetch_k=60,
-                )
+INSTRUÇÕES (template):
+{req.template}
 
-            log_registro_distribution(job_id, docs, "pré-cap")
-            docs, dropped = cap_registro_chunks(docs, "0450", MAX_0450_CHUNKS)
-            print(f"[SUMMARY][{job_id}] 0450 descartados: {dropped}")
-            log_registro_distribution(job_id, docs, "pós-cap")
+REGRAS:
+- NÃO invente números. Cite arquivo e registro de cada evidência.
+- Se não houver evidência, OMITA o item (não escreva "Dado não disponível" repetidamente).
+- Driva = apenas contexto de negócio, nunca evidência numérica.
+"""
+        with get_openai_callback() as cb:
+            response = llm.invoke(prompt)
+            tokens_used = cb.total_tokens
+            ptok = cb.prompt_tokens
+            ctok = cb.completion_tokens
 
-            # 🆕 Driva recuperado separadamente como contexto secundário
-            driva_docs = driva_context_retrieval(vector_store, k=5)
-            print(f"[SUMMARY][{job_id}] Driva chunks: {len(driva_docs)}")
+        content_str = response.content
+        structured = parse_summary_markdown(content_str)
+        generation_time_ms = int((time.time() - t_summary_start) * 1000)
 
-            periodo = extract_periodo_from_docs(docs)
-            if not periodo:
-                try:
-                    extra = vector_store.max_marginal_relevance_search(
-                        "0000 abertura período DT_INI DT_FIN", k=6, fetch_k=20,
-                    )
-                    periodo = extract_periodo_from_docs(extra)
-                except Exception:
-                    periodo = None
-            print(f"[SUMMARY][{job_id}] Período extraído: {periodo}")
-
-            for i, doc in enumerate(docs, start=1):
-                src = doc.metadata.get("source", "?")
-                reg = doc.metadata.get("registro") or primary_registro(doc.page_content) or "?"
-                print(f"[SUMMARY][{job_id}] Doc {i}/{len(docs)} reg={reg} source={src}")
-
-            partial_results = []
-            with get_openai_callback() as cb_extract:
-                for i, doc in enumerate(docs):
-                    reg = doc.metadata.get("registro") or primary_registro(doc.page_content) or "?"
-                    prompt = f"""
-                    Extraia APENAS dados REAIS do texto.
-                    Registro SPED predominante: {reg}
-
-                    RETORNE JSON:
-                    {{
-                    "evidencias": [
-                        {{
-                          "documento": "{doc.metadata.get("source")}",
-                          "chunk": "{doc.metadata.get("chunk_index")}",
-                          "registro": "{reg}",
-                          "trecho": "",
-                          "tipo": "financeiro | inconsistencia | fiscal | cadastral"
-                        }}
-                      ]
-                    }}
-
-                    REGRAS:
-                    - NÃO inventar nada
-                    - NÃO resumir
-                    - NÃO estimar valores
-                    - Se o registro for 0450, marque tipo="cadastral" e NÃO o trate como evidência financeira.
-                    - Se não houver evidência → retornar lista vazia
-
-                    TEXTO:
-                    {doc.page_content}
-                    """
-                    try:
-                        res = llm.invoke(prompt)
-                        content = res.content.strip()
-                        if content and "evidencias" in content:
-                            partial_results.append((content, doc))
-                    except Exception as e:
-                        print(f"[SUMMARY][{job_id}] erro doc {i}: {str(e)}")
-                total_tokens_used += cb_extract.total_tokens
-                prompt_tokens += cb_extract.prompt_tokens
-                completion_tokens += cb_extract.completion_tokens
-
-            print(f"[SUMMARY][{job_id}] válidos: {len(partial_results)} | tokens extração={cb_extract.total_tokens}")
-            if not partial_results:
-                raise Exception("Nenhuma evidência encontrada")
-
-            filtered_results = []
-            for idx, (r, doc) in enumerate(partial_results, start=1):
-                match = re.search(r"\{.*\}", r, re.DOTALL)
-                if not match:
-                    continue
-                try:
-                    data = json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    continue
-                evidencias = data.get("evidencias") or []
-                if not evidencias:
-                    evidencias = [{
-                        "documento": doc.metadata.get("source", "arquivo_sped"),
-                        "chunk": doc.metadata.get("chunk_index"),
-                        "registro": doc.metadata.get("registro", "?"),
-                        "trecho": doc.page_content[:1200],
-                        "tipo": "sped_raw",
-                    }]
-                valid = [e for e in evidencias if e.get("trecho") and str(e["trecho"]).strip()]
-                if valid:
-                    data["evidencias"] = valid
-                    filtered_results.append(json.dumps(data, ensure_ascii=False))
-
-            print(f"[SUMMARY][{job_id}] após filtro: {len(filtered_results)}")
-            if not filtered_results:
-                fallback = [r for (r, _) in partial_results if r and len(r.strip()) > 20]
-                if not fallback:
-                    raise Exception("Nenhuma resposta útil retornada pelo LLM")
-                filtered_results = fallback
-
-            agg_limit = 26000 if is_completa else 20000
-            aggregated = "\n\n".join(filtered_results)[:agg_limit]
-            print(f"[SUMMARY][{job_id}] Aggregated SPED size: {len(aggregated)} (limit={agg_limit})")
-
-            # 🆕 bloco Driva separado
-            driva_block = build_driva_block(driva_docs)
-
-            periodo_block = ""
-            if periodo:
-                periodo_block = f"""
-            ====================
-            PERÍODO ANALISADO (extraído do registro 0000)
-            ====================
-            {periodo}
-            """
-
-            final_prompt = f"""
-            {req.template}
-            {periodo_block}
-            ====================
-            EVIDÊNCIAS FISCAIS (SPED) — FONTE PRIMÁRIA
-            ====================
-            {aggregated}
-            {driva_block}
-            ====================
-            REGRAS OBRIGATÓRIAS (CRÍTICAS)
-            ====================
-            1. TODA informação deve citar origem EXPLÍCITA (documento + trecho literal).
-            2. PROIBIDO inventar valores, estimar números, generalizar sem evidência.
-            3. Se não houver evidência → "Dado não disponível nos arquivos analisados" (UMA vez por seção).
-            4. NÃO produzir nenhuma afirmação sem citação.
-
-            REGRAS DE SEPARAÇÃO DE FONTES (CRÍTICO):
-            5. Toda afirmação numérica/fiscal/contábil DEVE vir de [SPED] (bloco EVIDÊNCIAS FISCAIS).
-            6. Dados [DRIVA] servem APENAS como contexto de negócio (porte, regime tributário presumido,
-               CNAE, situação cadastral, sócios). NUNCA cite Driva como evidência de cálculo, base ou tributo.
-            7. Ao usar info Driva, qualifique como "contexto cadastral" e nunca derive cálculo dela.
-
-            REGRAS DE FORMATAÇÃO:
-            8. Substitua qualquer `X.N` pelo número real do capítulo (ex.: "4.3", nunca "X.3").
-            9. NÃO duplique títulos de seção.
-            10. Registros 0450 são INFORMAÇÕES COMPLEMENTARES — NÃO os use para cálculo de impacto/ROI.
-                Esses cálculos devem vir de M100/M200/M500/M600 e itens C170.
-            11. Período: use exatamente o do bloco "PERÍODO ANALISADO".
-            """
-
-            job_update(job_id, stage="final_llm")
-            with get_openai_callback() as cb_final:
-                final = llm.invoke(final_prompt)
-                total_tokens_used += cb_final.total_tokens
-                prompt_tokens += cb_final.prompt_tokens
-                completion_tokens += cb_final.completion_tokens
-
-            generation_time_ms = int((time.time() - t_summary_start) * 1000)
-            content_str = final.content
-            structured = parse_summary_markdown(content_str)
-
-            job_update(
-                job_id, status="completed", stage="done",
-                result={
-                    "mode": mode, "content": content_str,
-                    "model": LLM_MODEL, "model_used": LLM_MODEL,
-                    "tokens_used": total_tokens_used,
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "generation_time_ms": generation_time_ms,
-                    "periodo_detectado": periodo,
-                    "insights": structured["insights"],
-                    "calculations": structured["calculations"],
-                    "data_crossings": structured["data_crossings"],
-                    "source_references": structured["source_references"],
-                    "sources_used": len(docs),
-                    "driva_chunks_used": len(driva_docs),
-                },
-            )
-
-        print(f"[SUMMARY][{job_id}] ✅ DONE | tokens_total={total_tokens_used} | {generation_time_ms}ms")
+        job_update(
+            job_id, status="completed", stage="done",
+            result={
+                "mode": "legacy_oneshot",
+                "content": content_str,
+                "model": LLM_MODEL, "model_used": LLM_MODEL,
+                "tokens_used": tokens_used,
+                "prompt_tokens": ptok,
+                "completion_tokens": ctok,
+                "generation_time_ms": generation_time_ms,
+                "periodo_detectado": periodo,
+                "insights": structured["insights"],
+                "calculations": structured["calculations"],
+                "data_crossings": structured["data_crossings"],
+                "source_references": structured["source_references"],
+            },
+        )
+        print(f"[SUMMARY][{job_id}] ✅ LEGACY DONE | tokens={tokens_used} | {generation_time_ms}ms")
 
     except Exception as e:
         print(f"[SUMMARY][{job_id}] ❌ ERROR")
@@ -1037,7 +1132,7 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
 
 # -------------------------------
-# ENRICHMENT (Driva) — agora com pré-processamento e source_kind
+# ENRICHMENT (Driva)
 # -------------------------------
 def enrichment_to_text(data, parent_key=""):
     texts = []
@@ -1057,8 +1152,6 @@ def enrichment_to_text(data, parent_key=""):
 async def upload_enrichment(req: EnrichmentRequest):
     try:
         vector_store = get_vector_store(req.project_id)
-
-        # 🆕 pré-processamento: descarta campos irrelevantes
         filtered = preprocess_driva(req.enrichment)
         if not filtered:
             return {"status": "success", "chunks_saved": 0, "message": "Nenhum campo Driva relevante encontrado"}
@@ -1071,7 +1164,7 @@ async def upload_enrichment(req: EnrichmentRequest):
             metadatas.append({
                 "project_id": req.project_id,
                 "type": "enrichment",
-                "source_kind": "driva",  # 🆕 namespace
+                "source_kind": "driva",
                 "source": req.source,
                 "chunk_index": idx,
                 "registro": "enrichment",
