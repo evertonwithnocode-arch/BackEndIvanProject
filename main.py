@@ -89,6 +89,21 @@ LLM_MODEL_PLANNER   = "gpt-4o-mini"   # planejamento e crítica → barato
 LLM_MODEL_INVESTIGATOR = "gpt-4o-mini"  # loop de retrieval/análise
 LLM_MODEL_SYNTH     = "gpt-4o-mini"        # síntese final → qualidade
 
+ALLOWED_LLM_MODELS = {
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+}
+
+def resolve_model(requested: Optional[str], fallback: str) -> str:
+    """Valida o modelo pedido pelo cliente; cai no default se inválido."""
+    if requested and requested in ALLOWED_LLM_MODELS:
+        return requested
+    if requested:
+        print(f"[MODEL] ⚠️ modelo '{requested}' não permitido, usando '{fallback}'")
+    return fallback
+
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
@@ -698,40 +713,42 @@ Regras inegociáveis:
 """
 
 
-def planner_agent(template: str, query: str) -> Dict[str, Any]:
+def planner_agent(template: str, query: str, model: str) -> Dict[str, Any]:
     user = f"TEMPLATE:\n\"\"\"\n{template[:6000]}\n\"\"\"\n\nOBJETIVO: {query}\n"
-    out = _llm_json(LLM_MODEL_PLANNER, PLANNER_SYS, user, max_tokens=1200)
+    out = _llm_json(model, PLANNER_SYS, user, max_tokens=1200)
     out.setdefault("topics", []); out.setdefault("registros", [])
     out.setdefault("hypotheses", []); out.setdefault("initial_queries", [])
     out.setdefault("needs_driva", True)
     return out
 
 
-def critic_agent(plan: Dict[str,Any], mem: InvestigationMemory, graph: EvidenceGraph) -> Dict[str, Any]:
+def critic_agent(plan: Dict[str, Any], mem: InvestigationMemory,
+                 graph: EvidenceGraph, model: str) -> Dict[str, Any]:
     coverage = mem.coverage_score(plan.get("topics", []))
     payload = {
-        "plan_topics":      plan.get("topics", []),
-        "plan_registros":   plan.get("registros", []),
-        "queries_done":     mem.queries_done[-20:],
-        "registros_covered":dict(mem.registros_covered),
-        "topics_covered":   sorted(mem.topics_covered),
-        "coverage_score":   round(coverage, 3),
-        "evidence_count":   len(mem.evidence),
-        "graph_edges":      graph.export(),
-        "hypotheses":       mem.hypotheses,
+        "plan_topics":       plan.get("topics", []),
+        "plan_registros":    plan.get("registros", []),
+        "queries_done":      mem.queries_done[-20:],
+        "registros_covered": dict(mem.registros_covered),
+        "topics_covered":    sorted(mem.topics_covered),
+        "coverage_score":    round(coverage, 3),
+        "evidence_count":    len(mem.evidence),
+        "graph_edges":       graph.export(),
+        "hypotheses":        mem.hypotheses,
     }
     out = _llm_json(
-        LLM_MODEL_INVESTIGATOR, CRITIC_SYS,
+        model, CRITIC_SYS,
         json.dumps(payload, ensure_ascii=False), max_tokens=700,
     )
     out.setdefault("ready", coverage >= AGENT_REFLECTION_THRESHOLD and len(mem.evidence) > 0)
     out.setdefault("gaps", []); out.setdefault("refined_queries", [])
-    out.setdefault("target_registros", []); out.setdefault("reasoning","")
+    out.setdefault("target_registros", []); out.setdefault("reasoning", "")
     return out
 
 
 def synthesizer_agent(template: str, periodo: Optional[str],
-                      mem: InvestigationMemory, graph: EvidenceGraph) -> Tuple[str, Dict[str,int]]:
+                      mem: InvestigationMemory, graph: EvidenceGraph,
+                      model: str) -> Tuple[str, Dict[str, int]]:
     compressed = compress_context(mem.evidence, AGENT_COMPRESSION_TOPN)
     user = f"""PERÍODO FISCAL: {periodo or 'não detectado'}
 
@@ -755,8 +772,9 @@ EVIDÊNCIAS (top-{AGENT_COMPRESSION_TOPN}, comprimidas):
 Produza AGORA o sumário final em Markdown.
 """
     resp = openai_client.chat.completions.create(
-        model=LLM_MODEL_SYNTH,
-        messages=[{"role":"system","content":SYNTH_SYS},{"role":"user","content":user}],
+        model=model,                          # ⬅️ dinâmico
+        messages=[{"role": "system", "content": SYNTH_SYS},
+                  {"role": "user", "content": user}],
         temperature=0.2,
     )
     usage = {
@@ -780,6 +798,11 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
     project_id = req.project_id
     template = req.template
     objective = req.query or "gerar sumário fiscal completo"
+    
+    model_planner = resolve_model(req.model, LLM_MODEL_PLANNER)
+    model_critic  = resolve_model(req.model, LLM_MODEL_INVESTIGATOR)
+    model_synth   = resolve_model(req.model, LLM_MODEL_SYNTH)
+    print(f"[ORCH][{job_id}] models => planner={model_planner} critic={model_critic} synth={model_synth}")
 
     t0 = time.time()
     tokens_total = {"prompt":0, "completion":0}
@@ -787,9 +810,12 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
 
     # ---------- FASE 1: PLAN ----------
     job_update(job_id, stage="agent_plan")
-    plan = planner_agent(template, objective)
-    u = plan.pop("_usage", {}); tokens_total["prompt"]+=u.get("prompt_tokens",0); tokens_total["completion"]+=u.get("completion_tokens",0)
-    trace.append({"phase":"plan","topics":plan["topics"],"registros":plan["registros"],"queries":plan["initial_queries"]})
+    plan = planner_agent(template, objective, model=model_planner)
+    u = plan.pop("_usage", {})
+    tokens_total["prompt"]     += u.get("prompt_tokens", 0)
+    tokens_total["completion"] += u.get("completion_tokens", 0)
+    trace.append({"phase": "plan", "topics": plan["topics"],
+                  "registros": plan["registros"], "queries": plan["initial_queries"]})
     print(f"[ORCH][{job_id}] PLAN | topics={len(plan['topics'])} regs={plan['registros']} init_q={len(plan['initial_queries'])}")
 
     mem = InvestigationMemory()
@@ -854,7 +880,7 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
 
         # ----- REFLECTION / CRITIC -----
         job_update(job_id, stage=f"agent_critic_{round_idx+1}")
-        critique = critic_agent(plan, mem, graph)
+        critique = critic_agent(plan, mem, graph, model=model_critic)
         u = critique.pop("_usage", {}); tokens_total["prompt"]+=u.get("prompt_tokens",0); tokens_total["completion"]+=u.get("completion_tokens",0)
         trace.append({"phase":"critic","round":round_idx+1,"ready":critique["ready"],
                       "gaps":critique["gaps"][:5],"reasoning":critique["reasoning"]})
@@ -887,7 +913,7 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
 
     # ---------- FASE 3: SYNTH ----------
     job_update(job_id, stage="agent_synth", progress=90)
-    final_md, synth_usage = synthesizer_agent(template, periodo, mem, graph)
+    final_md, synth_usage = synthesizer_agent(template, periodo, mem, graph, model=model_synth)
     tokens_total["prompt"]+=synth_usage.get("prompt_tokens",0)
     tokens_total["completion"]+=synth_usage.get("completion_tokens",0)
     trace.append({"phase":"synth","prompt_tokens":synth_usage.get("prompt_tokens",0),
@@ -907,6 +933,7 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
         "memory":       mem.snapshot(),
         "graph":        graph.export(),
         "searches":     total_searches,
+        "model":        model_synth,
         "trace":        trace,
     }
 
@@ -977,6 +1004,7 @@ class SummaryRequest(BaseModel):
     k: Optional[int] = 20
     project_id: str
     agentic: Optional[bool] = True
+    model: Optional[str] = None  
 
 class EnrichmentRequest(BaseModel):
     project_id: str
@@ -1036,6 +1064,7 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
 def _legacy_oneshot_summary(req: SummaryRequest, job_id: str, t_start: float):
     """Fallback one-shot caso o orquestrador agentic falhe."""
     job_update(job_id, stage="legacy_oneshot")
+    model_synth = resolve_model(req.model, LLM_MODEL_SYNTH)
     docs = hybrid_search(req.project_id, req.query or "sumário geral",
                          k=min(req.k or 12, AGENT_MAX_K), source_kind="sped")
     ctx_parts=[]
@@ -1054,14 +1083,14 @@ TEMPLATE:
 {req.template}
 
 REGRAS: Não invente. Cite arquivo+registro. Se faltar evidência, OMITA o item."""
-    llm = ChatOpenAI(model=LLM_MODEL_SYNTH, temperature=0.0, api_key=OPENAI_API_KEY)
+    llm = ChatOpenAI(model=model_synth, temperature=0.0, api_key=OPENAI_API_KEY)
     with get_openai_callback() as cb:
         resp = llm.invoke(prompt)
         tok, pt, ct = cb.total_tokens, cb.prompt_tokens, cb.completion_tokens
     structured = parse_summary_markdown(resp.content)
     job_update(job_id, status="completed", stage="done",
                result={"mode":"legacy_oneshot","content":resp.content,
-                       "model":LLM_MODEL_SYNTH,"model_used":LLM_MODEL_SYNTH,
+                       "model":LLM_MODEL_SYNTH,"model_used":model_synth,
                        "tokens_used":tok,"prompt_tokens":pt,"completion_tokens":ct,
                        "generation_time_ms":int((time.time()-t_start)*1000),
                        "periodo_detectado":periodo,
@@ -1088,8 +1117,8 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                     result={
                         "mode": "agentic_v2",
                         "content": out["markdown"],
-                        "model": LLM_MODEL_SYNTH,
-                        "model_used": LLM_MODEL_SYNTH,
+                        "model":   out["model"], 
+                        "model_used":   out["model"], 
                         "tokens_used":      out["tokens"]["total"],
                         "prompt_tokens":    out["tokens"]["prompt"],
                         "completion_tokens":out["tokens"]["completion"],
