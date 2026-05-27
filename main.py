@@ -94,6 +94,7 @@ ALLOWED_LLM_MODELS = {
     "gpt-4o",
     "gpt-4.1-mini",
     "gpt-4.1",
+    "gpt-4.1-nano",
 }
 
 def resolve_model(requested: Optional[str], fallback: str) -> str:
@@ -1107,27 +1108,30 @@ REGRAS:
         pt = cb.prompt_tokens
         ct = cb.completion_tokens
 
-    structured = parse_summary_markdown(resp.content) or {}
+    raw_markdown = out.get("markdown", "") or ""
+
+
+    structured = parse_summary_markdown(raw_markdown) or {}
 
     final_content = {
-        "visao_geral": structured.get("overview") or "",
-        "insights": structured.get("insights") or [],
-        "inconsistencias": structured.get("inconsistencies") or [],
-        "oportunidades": structured.get("opportunities") or [],
-        "analises": structured.get("analyses") or [],
-        "calculos": structured.get("calculations") or {},
-        "cruzamento_de_dados": structured.get("data_crossings") or {},
-        "justificativas": structured.get("justifications") or [],
-        "referencias": structured.get("source_references") or [],
+    # ⭐ RELATÓRIO PRINCIPAL COMPLETO
+    "executive_summary": raw_markdown,
+
+    # blocos estruturados auxiliares
+    "insights": structured.get("insights") or [],
+    "calculos": structured.get("calculations") or [],
+    "cruzamento_de_dados": structured.get("data_crossings") or [],
+    "referencias": structured.get("source_references") or [],
     }
 
+    # remove apenas vazios
     final_content = {
         k: v for k, v in final_content.items()
         if v not in (None, "", [], {})
     }
 
-    if not final_content:
-        final_content = {"texto": resp.content}
+    if not final_content.get("executive_summary"):
+       final_content["executive_summary"] = raw_markdown
 
     job_update(
         job_id,
