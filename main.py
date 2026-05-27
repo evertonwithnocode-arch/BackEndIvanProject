@@ -1108,30 +1108,27 @@ REGRAS:
         pt = cb.prompt_tokens
         ct = cb.completion_tokens
 
-    raw_markdown = out.get("markdown", "") or ""
-
-
-    structured = parse_summary_markdown(raw_markdown) or {}
+    structured = parse_summary_markdown(resp.content) or {}
 
     final_content = {
-    # ⭐ RELATÓRIO PRINCIPAL COMPLETO
-    "executive_summary": raw_markdown,
-
-    # blocos estruturados auxiliares
-    "insights": structured.get("insights") or [],
-    "calculos": structured.get("calculations") or [],
-    "cruzamento_de_dados": structured.get("data_crossings") or [],
-    "referencias": structured.get("source_references") or [],
+        "visao_geral": structured.get("overview") or "",
+        "insights": structured.get("insights") or [],
+        "inconsistencias": structured.get("inconsistencies") or [],
+        "oportunidades": structured.get("opportunities") or [],
+        "analises": structured.get("analyses") or [],
+        "calculos": structured.get("calculations") or {},
+        "cruzamento_de_dados": structured.get("data_crossings") or {},
+        "justificativas": structured.get("justifications") or [],
+        "referencias": structured.get("source_references") or [],
     }
 
-    # remove apenas vazios
     final_content = {
         k: v for k, v in final_content.items()
         if v not in (None, "", [], {})
     }
 
-    if not final_content.get("executive_summary"):
-       final_content["executive_summary"] = raw_markdown
+    if not final_content:
+        final_content = {"texto": resp.content}
 
     job_update(
         job_id,
@@ -1166,24 +1163,29 @@ def process_summary_job(job_id: str, req: SummaryRequest):
         if req.agentic:
             try:
                 out = orchestrate_summary(req, job_id)
-                structured = parse_summary_markdown(out["markdown"]) or {}
+                raw_markdown = out.get("markdown", "") or ""
+                print(f"[SUMMARY][{job_id}] RAW_MARKDOWN_EMPTY => {not bool(raw_markdown.strip())}")
+
+                print(f"[SUMMARY][{job_id}] RAW_MD_LEN => {len(raw_markdown)}")
+
+                structured = parse_summary_markdown(raw_markdown) or {}
 
                 final_content = {
-                    "visao_geral": structured.get("overview") or "",
-                    "insights": structured.get("insights") or [],
-                    "inconsistencias": structured.get("inconsistencies") or [],
-                    "oportunidades": structured.get("opportunities") or [],
-                    "analises": structured.get("analyses") or [],
-                    "calculos": structured.get("calculations") or {},
-                    "cruzamento_de_dados": structured.get("data_crossings") or {},
-                    "justificativas": structured.get("justifications") or [],
-                    "referencias": structured.get("source_references") or [],
+                 # ⭐ PRINCIPAL
+                 "visao_geral": raw_markdown,
+
+                 # auxiliares
+                 "insights": structured.get("insights") or [],
+                 "calculos": structured.get("calculations") or [],
+                 "cruzamento_de_dados": structured.get("data_crossings") or [],
+                 "referencias": structured.get("source_references") or [],
                 }
 
                 final_content = {
                     k: v for k, v in final_content.items()
                     if v not in (None, "", [], {})
                 }
+                print(f"[SUMMARY][{job_id}] FINAL_CONTENT_KEYS => {list(final_content.keys())}")
 
                 tokens = out.get("tokens") or {}
 
