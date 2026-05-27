@@ -87,7 +87,7 @@ EMBED_MODEL = "text-embedding-3-small"
 EMBED_BATCH = 256
 LLM_MODEL_PLANNER   = "gpt-4o-mini"   # planejamento e crítica → barato
 LLM_MODEL_INVESTIGATOR = "gpt-4o-mini"  # loop de retrieval/análise
-LLM_MODEL_SYNTH     = "gpt-4.1"        # síntese final → qualidade
+LLM_MODEL_SYNTH     = "gpt-4o-mini"        # síntese final → qualidade
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
