@@ -1062,46 +1062,96 @@ def process_job(job_id: str, files_data: List[dict], project_id: str):
 # PROCESS SUMMARY  →  usa o novo orchestrator (com fallback one-shot)
 # ==============================================================================
 def _legacy_oneshot_summary(req: SummaryRequest, job_id: str, t_start: float):
-    """Fallback one-shot caso o orquestrador agentic falhe."""
     job_update(job_id, stage="legacy_oneshot")
+
     model_synth = resolve_model(req.model, LLM_MODEL_SYNTH)
-    docs = hybrid_search(req.project_id, req.query or "sumário geral",
-                         k=min(req.k or 12, AGENT_MAX_K), source_kind="sped")
-    ctx_parts=[]
+
+    docs = hybrid_search(
+        req.project_id,
+        req.query or "sumário geral",
+        k=min(req.k or 12, AGENT_MAX_K),
+        source_kind="sped",
+    )
+
+    ctx_parts = []
     for d in docs:
         reg = d.metadata.get("registro") or primary_registro(d.page_content) or "?"
-        ctx_parts.append(f"[{d.metadata.get('source')} | reg {reg}]\n{d.page_content[:1500]}")
+        ctx_parts.append(
+            f"[{d.metadata.get('source')} | reg {reg}]\n"
+            f"{d.page_content[:1500]}"
+        )
+
     ctx = "\n\n---\n\n".join(ctx_parts)[:12000]
     periodo = extract_periodo_from_docs(docs)
 
     prompt = f"""Você é um auditor fiscal SPED.
 PERÍODO: {periodo or '?'}
+
 CONTEXTO:
 {ctx}
 
 TEMPLATE:
 {req.template}
 
-REGRAS: Não invente. Cite arquivo+registro. Se faltar evidência, OMITA o item."""
+REGRAS:
+- Não invente.
+- Cite arquivo + registro.
+- Se faltar evidência, omita o item.
+"""
+
     llm = ChatOpenAI(model=model_synth, temperature=0.0, api_key=OPENAI_API_KEY)
+
     with get_openai_callback() as cb:
         resp = llm.invoke(prompt)
-        tok, pt, ct = cb.total_tokens, cb.prompt_tokens, cb.completion_tokens
-    structured = parse_summary_markdown(resp.content)
-    job_update(job_id, status="completed", stage="done",
-               result={"mode":"legacy_oneshot","content":resp.content,
-                       "model":LLM_MODEL_SYNTH,"model_used":model_synth,
-                       "tokens_used":tok,"prompt_tokens":pt,"completion_tokens":ct,
-                       "generation_time_ms":int((time.time()-t_start)*1000),
-                       "periodo_detectado":periodo,
-                       "insights":structured["insights"],
-                       "calculations":structured["calculations"],
-                       "data_crossings":structured["data_crossings"],
-                       "source_references":structured["source_references"]})
+        tok = cb.total_tokens
+        pt = cb.prompt_tokens
+        ct = cb.completion_tokens
+
+    structured = parse_summary_markdown(resp.content) or {}
+
+    final_content = {
+        "visao_geral": structured.get("overview") or "",
+        "insights": structured.get("insights") or [],
+        "inconsistencias": structured.get("inconsistencies") or [],
+        "oportunidades": structured.get("opportunities") or [],
+        "analises": structured.get("analyses") or [],
+        "calculos": structured.get("calculations") or {},
+        "cruzamento_de_dados": structured.get("data_crossings") or {},
+        "justificativas": structured.get("justifications") or [],
+        "referencias": structured.get("source_references") or [],
+    }
+
+    final_content = {
+        k: v for k, v in final_content.items()
+        if v not in (None, "", [], {})
+    }
+
+    if not final_content:
+        final_content = {"texto": resp.content}
+
+    job_update(
+        job_id,
+        status="completed",
+        stage="done",
+        progress=100,
+        result={
+            "summary": final_content,
+            "mode": "legacy_oneshot",
+            "model": model_synth,
+            "model_used": model_synth,
+            "tokens_used": tok,
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "generation_time_ms": int((time.time() - t_start) * 1000),
+            "periodo_detectado": periodo,
+        },
+    )
+
 
 
 def process_summary_job(job_id: str, req: SummaryRequest):
     t0 = time.time()
+
     try:
         job_update(job_id, status="processing", stage="starting")
         print(f"[SUMMARY][{job_id}] 🚀 START | agentic={req.agentic}")
@@ -1112,72 +1162,64 @@ def process_summary_job(job_id: str, req: SummaryRequest):
         if req.agentic:
             try:
                 out = orchestrate_summary(req, job_id)
-                structured = parse_summary_markdown(out["markdown"])
+                structured = parse_summary_markdown(out["markdown"]) or {}
 
-                # ---------- CONTEÚDO FINAL (vai para summaries.content) ----------
-                # APENAS o que o usuário deve ver. Nada de planner/graph/hypotheses aqui.
                 final_content = {
-                    "visao_geral":       structured.get("overview", ""),
-                    "insights":          structured.get("insights", []),
-                    "inconsistencias":   structured.get("inconsistencies", []),
-                    "oportunidades":     structured.get("opportunities", []),
-                    "analises":          structured.get("analyses", []),
-                    "calculos":          structured.get("calculations", {}),
-                    "cruzamento_de_dados": structured.get("data_crossings", {}),
-                    "justificativas":    structured.get("justifications", []),
-                    "referencias":       structured.get("source_references", []),
+                    "visao_geral": structured.get("overview") or "",
+                    "insights": structured.get("insights") or [],
+                    "inconsistencias": structured.get("inconsistencies") or [],
+                    "oportunidades": structured.get("opportunities") or [],
+                    "analises": structured.get("analyses") or [],
+                    "calculos": structured.get("calculations") or {},
+                    "cruzamento_de_dados": structured.get("data_crossings") or {},
+                    "justificativas": structured.get("justifications") or [],
+                    "referencias": structured.get("source_references") or [],
                 }
 
-                # ---------- METADADOS DE EXECUÇÃO (telemetria, exibida em badges) ----------
-                meta = {
-                    "mode": "agentic_v2",
-                    "model": out["model"],
-                    "model_used": out["model"],
-                    "tokens_used":       out["tokens"]["total"],
-                    "prompt_tokens":     out["tokens"]["prompt"],
-                    "completion_tokens": out["tokens"]["completion"],
-                    "generation_time_ms": out["elapsed_ms"],
-                    "periodo_detectado":  out["periodo"],
+                final_content = {
+                    k: v for k, v in final_content.items()
+                    if v not in (None, "", [], {})
                 }
 
-                # ---------- DEBUG / TRACE (NÃO renderizado ao usuário) ----------
-                debug = {
-                    "plan":     out.get("plan"),
-                    "memory":   out.get("memory"),
-                    "graph":    out.get("graph"),
-                    "searches": out.get("searches"),
-                    "trace":    out.get("trace"),
-                    "markdown_raw": out["markdown"],  # mantém o markdown bruto p/ auditoria
-                }
+                tokens = out.get("tokens") or {}
 
                 job_update(
                     job_id,
                     status="completed",
                     stage="done",
+                    progress=100,
                     result={
-                        **meta,
-                        "content": final_content,   # <-- só o sumário limpo
-                        "debug":   debug,           # <-- separado, opcional p/ a UI
+                        # O frontend salva SOMENTE rawResult.summary em summaries.content
+                        "summary": final_content,
+
+                        # Metadados ficam fora do JSON visual do sumário
+                        "mode": "agentic_v2",
+                        "model": out.get("model"),
+                        "model_used": out.get("model"),
+                        "tokens_used": tokens.get("total"),
+                        "prompt_tokens": tokens.get("prompt"),
+                        "completion_tokens": tokens.get("completion"),
+                        "generation_time_ms": out.get("elapsed_ms"),
+                        "periodo_detectado": out.get("periodo"),
                     },
                 )
 
                 print(
                     f"[SUMMARY][{job_id}] ✅ AGENTIC_V2 DONE | "
-                    f"searches={out['searches']} | tokens={out['tokens']['total']} | {out['elapsed_ms']}ms"
+                    f"searches={out.get('searches')} | "
+                    f"tokens={tokens.get('total')} | {out.get('elapsed_ms')}ms"
                 )
                 return
 
             except Exception as e:
                 print(f"[SUMMARY][{job_id}] ⚠️ orchestrator falhou: {e}")
                 print(traceback.format_exc())
-                # fallthrough → legacy
 
         _legacy_oneshot_summary(req, job_id, t0)
 
     except Exception as e:
         print(traceback.format_exc())
         job_update(job_id, status="error", error=str(e))
-
 
 # ==============================================================================
 # ENRICHMENT (Driva) — preservado
