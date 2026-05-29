@@ -1335,17 +1335,25 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
     # ---------- Driva (opcional, 1 chamada compacta) ----------
     if plan.get("needs_driva"):
         try:
-            d_docs = hybrid_search(project_id, "porte regime tributário CNAE sócios atividade",
-                                   k=5, source_kind="driva")
-            for i,d in enumerate(d_docs):
+            d_docs = hybrid_search(
+                project_id,
+                "porte regime tributário CNAE sócios atividade",
+                k=5,
+                source_kind="driva"
+            )
+            for i, d in enumerate(d_docs):
                 mem.add_evidence(d, topic="contexto_empresa", score=0.4 - i*0.02)
+
         except Exception as e:
             print(f"[ORCH][{job_id}] driva opcional falhou: {e}")
-            analytics = build_analytics(mem)
-            trace.append({
-            "phase": "analytics",
-            "metrics": analytics
-            })
+
+    # 👇 SEMPRE fora do try/except
+    analytics = build_analytics(mem)
+
+    trace.append({
+    "phase": "analytics",
+    "metrics": analytics
+    })
     
     # ---------- FASE 3: SYNTH ----------
     job_update(job_id, stage="agent_synth", progress=90)
