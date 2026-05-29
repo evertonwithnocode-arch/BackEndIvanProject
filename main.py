@@ -1087,10 +1087,11 @@ Você é o SYNTHESIZER fiscal/SPED responsável por produzir relatórios fiscais
 
 
 Priorize SEMPRE:
-1. analytics estruturados
-2. métricas quantitativas
-3. agregações
-4. cruzamentos calculados
+1. structured_analysis.json calculado pelo backend
+2. analytics estruturados
+3. métricas quantitativas
+4. agregações
+5. cruzamentos calculados
 
 Responda SOMENTE com o documento final.
 NÃO estime valores.
@@ -1165,6 +1166,14 @@ REGRAS CRÍTICAS DE EVIDÊNCIA:
 - NÃO extrapole impacto financeiro.
 - NÃO estime ROI sem cálculo explícito nas evidências.
 - NÃO gere tabelas parcialmente vazias.
+- NÃO escreva linhas de tabela com:
+  "Não quantificado"
+  "Não aplicável"
+  "Aberto"
+  "-"
+  "0" quando o zero não vier do structured_analysis.json
+- Se o template pedir uma linha obrigatória, mas o backend não trouxe dado objetivo:
+  OMITA a linha. Não explique a ausência.
 
 - Só inclua tabelas se houver pelo menos:
   - 2 linhas completas
@@ -1229,6 +1238,97 @@ ou
 "Segue abaixo o relatório..."
 """
 
+PLACEHOLDER_PATTERNS = (
+    "não quantificado",
+    "nao quantificado",
+    "não aplicável",
+    "nao aplicavel",
+    "não há evidências suficientes",
+    "nao ha evidencias suficientes",
+    "informação insuficiente",
+    "informacao insuficiente",
+    "não detectado",
+    "nao detectado",
+    "indefinido",
+    "aberto",
+)
+
+
+def _strip_accents_for_filter(text: str) -> str:
+    table = str.maketrans("áàâãéêíóôõúçÁÀÂÃÉÊÍÓÔÕÚÇ", "aaaaeeioooucAAAAEEIOOOUC")
+    return (text or "").translate(table).lower()
+
+
+def _is_placeholder_line(line: str) -> bool:
+    normalized = _strip_accents_for_filter(line)
+    return any(p in normalized for p in PLACEHOLDER_PATTERNS)
+
+
+def _is_markdown_table_line(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2
+
+
+def _is_separator_row(line: str) -> bool:
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", c or "") for c in cells)
+
+
+def _row_has_real_data(line: str) -> bool:
+    if _is_placeholder_line(line):
+        return False
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    if len(cells) < 2:
+        return False
+    weak = {"", "-", "—", "0", "0,00", "r$ 0", "r$ 0,00"}
+    normalized_cells = [_strip_accents_for_filter(c) for c in cells]
+    if any(c in weak for c in normalized_cells[1:]):
+        return False
+    return not all(c in weak for c in normalized_cells)
+
+
+def sanitize_final_markdown(markdown: str) -> str:
+    """Remove placeholders e tabelas incompletas que o LLM tentou preencher."""
+    if not markdown:
+        return markdown
+
+    output: List[str] = []
+    lines = markdown.splitlines()
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        if not _is_markdown_table_line(line):
+            if not _is_placeholder_line(line):
+                output.append(line)
+            i += 1
+            continue
+
+        table: List[str] = []
+        while i < len(lines) and _is_markdown_table_line(lines[i]):
+            table.append(lines[i])
+            i += 1
+
+        if len(table) < 2:
+            continue
+
+        header = table[0]
+        separator = table[1] if len(table) > 1 and _is_separator_row(table[1]) else None
+        data_rows = table[2:] if separator else table[1:]
+        clean_rows = [row for row in data_rows if _row_has_real_data(row)]
+
+        if not clean_rows:
+            continue
+
+        output.append(header)
+        if separator:
+            output.append(separator)
+        output.extend(clean_rows)
+
+    cleaned = "\n".join(output)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
 
 def planner_agent(template: str, query: str, model: str) -> Dict[str, Any]:
     user = f"TEMPLATE:\n\"\"\"\n{template[:6000]}\n\"\"\"\n\nOBJETIVO: {query}\n"
@@ -1284,19 +1384,24 @@ HIPÓTESES INVESTIGADAS:
 LACUNAS CONHECIDAS:
 {json.dumps(mem.gaps, ensure_ascii=False)}
 
+STRUCTURED_ANALYSIS.JSON CALCULADO PELO BACKEND:
+{json.dumps(analytics.get("structured_analysis", {}), ensure_ascii=False, indent=2)}
+
 MÉTRICAS FISCAIS ESTRUTURADAS:
-{json.dumps(analytics, ensure_ascii=False, indent=2)}
+{json.dumps({k: v for k, v in analytics.items() if k != "structured_analysis"}, ensure_ascii=False, indent=2)}
 
 EVIDÊNCIAS QUALITATIVAS:
 {compressed}
 
 Produza AGORA o sumário final em Markdown.
+Use tabelas somente com linhas completas vindas do structured_analysis.json.
+Se uma linha tiver campo sem dado, omita a linha inteira.
 """
     resp = openai_client.chat.completions.create(
         model=model,                          # ⬅️ dinâmico
         messages=[{"role": "system", "content": SYNTH_SYS},
                   {"role": "user", "content": user}],
-        temperature=0.2,
+        temperature=0.0,
     )
     usage = {
         "prompt_tokens":     resp.usage.prompt_tokens if resp.usage else 0,
@@ -1734,6 +1839,7 @@ def process_summary_job(job_id: str, req: SummaryRequest):
             try:
                 out = orchestrate_summary(req, job_id)
                 raw_markdown = _strip_md_fences(out.get("markdown", "") or "")
+                raw_markdown = sanitize_final_markdown(raw_markdown)
                 print(f"[SUMMARY][{job_id}] RAW_MARKDOWN_EMPTY => {not bool(raw_markdown.strip())}")
 
                 print(f"[SUMMARY][{job_id}] RAW_MD_LEN => {len(raw_markdown)}")
