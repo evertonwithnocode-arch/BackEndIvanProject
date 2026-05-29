@@ -252,7 +252,7 @@ def get_vector_store(project_id: str):
 # ==============================================================================
 # SPED HELPERS (preservado + tabela de relações entre registros)
 # ==============================================================================
-SPED_REGISTRO_REGEX = re.compile(r"^\|([0-9A-Z]{4})\|", re.MULTILINE)
+SPED_REGISTRO_REGEX = re.compile(r"^\|\s*([0-9A-Z]{3,4})\s*\|", re.MULTILINE)
 SPED_0000_REGEX = re.compile(r"\|0000\|[^|]*\|[^|]*\|(\d{8})\|(\d{8})\|", re.MULTILINE)
 
 # Grafo de relações conhecidas entre registros — usado pelo EvidenceGraph
@@ -1244,6 +1244,7 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
     u = plan.pop("_usage", {})
     tokens_total["prompt"]     += u.get("prompt_tokens", 0)
     tokens_total["completion"] += u.get("completion_tokens", 0)
+    analytics = build_analytics(mem)
     trace.append({"phase": "plan", "topics": plan["topics"],
                   "registros": plan["registros"], "queries": plan["initial_queries"]})
     print(f"[ORCH][{job_id}] PLAN | topics={len(plan['topics'])} regs={plan['registros']} init_q={len(plan['initial_queries'])}")
