@@ -1269,6 +1269,62 @@ def _is_markdown_table_line(line: str) -> bool:
     return stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2
 
 
+def _is_heading_line(line: str) -> bool:
+    stripped = (line or "").strip()
+    if re.match(r"^#{1,6}\s+\S+", stripped):
+        return True
+    if re.match(r"^\d+(?:\.\d+)*\.\s+\S+", stripped):
+        return True
+    upper = _strip_accents_for_filter(stripped).upper()
+    if upper in {
+        "DOCUMENTO 1: RELATORIO EXECUTIVO ESTRATEGICO",
+        "DOCUMENTO 2: DETALHAMENTO DE OPORTUNIDADES ESTRATEGICAS",
+        "CONSOLIDACAO FINAL",
+        "TABELA CONSOLIDADA DE OPORTUNIDADES",
+        "CRONOGRAMA DE IMPLEMENTACAO",
+        "DECISOES REQUERIDAS DO CEO/CFO",
+    }:
+        return True
+    return upper.startswith((
+        "DOCUMENTO 1:",
+        "DOCUMENTO 2:",
+        "CONSOLIDA",
+        "TABELA CONSOLIDADA",
+        "CRONOGRAMA DE IMPLEMENTA",
+        "DECIS",
+    ))
+
+
+def _line_has_real_content(line: str) -> bool:
+    stripped = (line or "").strip()
+    if not stripped:
+        return False
+    if _is_heading_line(stripped):
+        return False
+    if _is_separator_row(stripped):
+        return False
+    if _is_placeholder_line(stripped):
+        return False
+    return True
+
+
+def _heading_level(line: str) -> int:
+    stripped = (line or "").strip()
+    markdown = re.match(r"^(#{1,6})\s+\S+", stripped)
+    if markdown:
+        return len(markdown.group(1))
+
+    upper = _strip_accents_for_filter(stripped).upper()
+    if upper.startswith(("DOCUMENTO 1:", "DOCUMENTO 2:", "CONSOLIDA")):
+        return 1
+
+    numbered = re.match(r"^(\d+(?:\.\d+)*)\.\s+\S+", stripped)
+    if numbered:
+        return 1 + numbered.group(1).count(".") + 1
+
+    return 2
+
+
 def _is_separator_row(line: str) -> bool:
     cells = [c.strip() for c in line.strip().strip("|").split("|")]
     return bool(cells) and all(re.fullmatch(r":?-{3,}:?", c or "") for c in cells)
@@ -1326,8 +1382,54 @@ def sanitize_final_markdown(markdown: str) -> str:
         output.extend(clean_rows)
 
     cleaned = "\n".join(output)
+    cleaned = remove_empty_sections(cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
+
+
+def remove_empty_sections(markdown: str) -> str:
+    """Remove cabecalhos que ficaram sem conteudo real apos a limpeza."""
+    lines = markdown.splitlines()
+    keep = [True] * len(lines)
+    headings = [i for i, line in enumerate(lines) if _is_heading_line(line)]
+
+    for idx, start in enumerate(headings):
+        level = _heading_level(lines[start])
+        end = len(lines)
+        for next_start in headings[idx + 1:]:
+            if _heading_level(lines[next_start]) <= level:
+                end = next_start
+                break
+        body = lines[start + 1:end]
+        has_real_content = any(_line_has_real_content(line) for line in body)
+        if not has_real_content:
+            for pos in range(start, end):
+                keep[pos] = False
+
+    cleaned = [line for i, line in enumerate(lines) if keep[i]]
+
+    # Remove documento/consolidacao que ficaram apenas como container de subtitulos removidos.
+    changed = True
+    while changed:
+        changed = False
+        lines = cleaned
+        keep = [True] * len(lines)
+        headings = [i for i, line in enumerate(lines) if _is_heading_line(line)]
+        for idx, start in enumerate(headings):
+            level = _heading_level(lines[start])
+            end = len(lines)
+            for next_start in headings[idx + 1:]:
+                if _heading_level(lines[next_start]) <= level:
+                    end = next_start
+                    break
+            body = lines[start + 1:end]
+            if not any(_line_has_real_content(line) for line in body):
+                for pos in range(start, end):
+                    keep[pos] = False
+                changed = True
+        cleaned = [line for i, line in enumerate(lines) if keep[i]]
+
+    return "\n".join(cleaned)
 
 
 def planner_agent(template: str, query: str, model: str) -> Dict[str, Any]:
