@@ -1,34 +1,3 @@
-"""
-================================================================================
-AGENTIC RAG ORCHESTRATION ENGINE — SPED / Fiscal
-================================================================================
-Refactor profundo: substitui o loop "one-shot tool-calling" por uma
-orquestração multi-agente inspirada em LangGraph / Deep Research / Manus /
-Devin / Cursor Agent.
-
-Pipeline lógico:
-
-    User Prompt
-        │
-        ▼
-    [PLANNER]   ──>  decompõe em sub-tarefas, hipóteses, registros-alvo
-        │
-        ▼
-    [INVESTIGATOR LOOP]   (até N rodadas, com reflection)
-        │   ├── HybridRetriever  (semântico + BM25 + metadata)
-        │   ├── EvidenceGraph    (conecta registros: C170↔M100↔M200 …)
-        │   ├── InvestigationMemory  (já-buscado, lacunas, hipóteses)
-        │   ├── ContextCompressor    (dedup + rerank + prune)
-        │   └── [CRITIC]  detecta lacunas/inconsistências → REFINA query
-        │
-        ▼
-    [SYNTHESIZER]  produz o sumário final em Markdown,
-                   citando apenas evidências validadas.
-
-Todas as endpoints e contratos públicos do main.py original são preservados.
-================================================================================
-"""
-
 import re
 import json
 import math
@@ -931,7 +900,7 @@ def critic_agent(plan: Dict[str, Any], mem: InvestigationMemory,
 
 def synthesizer_agent(template: str, periodo: Optional[str],
                       mem: InvestigationMemory,
-                       analytics: Dict[str, Any], graph: EvidenceGraph,
+                      analytics: Dict[str, Any], graph: EvidenceGraph,
                       model: str) -> Tuple[str, Dict[str, int]]:
     compressed = compress_context(mem.evidence, AGENT_COMPRESSION_TOPN)
     user = f"""PERÍODO FISCAL: {periodo or 'não detectado'}
@@ -1101,7 +1070,7 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
     analytics = build_analytics(mem)
     # ---------- FASE 3: SYNTH ----------
     job_update(job_id, stage="agent_synth", progress=90)
-    final_md, synth_usage = synthesizer_agent(template, periodo, analytics, mem, graph, model=model_synth)
+    final_md, synth_usage = synthesizer_agent(template, periodo, mem, analytics, graph, model=model_synth)
     tokens_total["prompt"]+=synth_usage.get("prompt_tokens",0)
     tokens_total["completion"]+=synth_usage.get("completion_tokens",0)
     trace.append({"phase":"synth","prompt_tokens":synth_usage.get("prompt_tokens",0),
