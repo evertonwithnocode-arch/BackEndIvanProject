@@ -1,3 +1,5 @@
+from collections import defaultdict
+from decimal import Decimal
 import re
 import json
 import math
@@ -66,6 +68,8 @@ ALLOWED_LLM_MODELS = {
     "gpt-4.1-nano",
 }
 
+
+
 def resolve_model(requested: Optional[str], fallback: str) -> str:
     """Valida o modelo pedido pelo cliente; cai no default se inválido."""
     if requested and requested in ALLOWED_LLM_MODELS:
@@ -86,7 +90,7 @@ AGENT_SEARCHES_PER_ROUND = 5     # buscas paralelas por rodada
 AGENT_DEFAULT_K          = 8
 AGENT_MAX_K              = 20
 AGENT_MAX_CHUNK_CHARS    = 1500
-AGENT_EVIDENCE_BUDGET    = 80    # máximo de evidências mantidas na memória
+AGENT_EVIDENCE_BUDGET    = 250    # máximo de evidências mantidas na memória
 AGENT_COMPRESSION_TOPN   = 40    # top-N evidências enviadas ao synthesizer
 AGENT_REFLECTION_THRESHOLD = 0.55  # cobertura mínima para encerrar
 
@@ -565,35 +569,289 @@ class EvidenceGraph:
 # ==============================================================================
 # CONTEXT COMPRESSOR
 # ==============================================================================
+class SpedAnalyticsEngine:
+
+    def __init__(self, evidence: List[Dict[str, Any]]):
+
+        self.evidence = evidence
+
+        self.metrics = {
+            "c100_vs_c170": {
+                "documents_analyzed": 0,
+                "divergent_documents": 0,
+                "total_divergence": 0.0,
+            },
+
+            "ncm_inconsistencies": {
+                "count": 0,
+                "affected_ncms": [],
+            },
+
+            "cfop_statistics": {},
+
+            "cst_statistics": {},
+
+            "credit_analysis": {
+                "pis_credit_total": 0.0,
+                "cofins_credit_total": 0.0,
+                "credit_documents": 0,
+            },
+
+            "sequence_breaks": {
+                "count": 0,
+            },
+
+            "registros": {},
+
+            "totals": {
+                "evidence_count": len(evidence),
+            }
+        }
+
+    # =========================================================
+    # HELPERS
+    # =========================================================
+
+    def _extract_money_values(self, text: str) -> List[float]:
+
+        vals = []
+
+        for m in re.findall(r"\d{1,3}(?:\.\d{3})*,\d{2}", text):
+
+            try:
+                vals.append(
+                    float(
+                        m.replace(".", "").replace(",", ".")
+                    )
+                )
+            except:
+                pass
+
+        return vals
+
+    def _extract_cfops(self, text: str) -> List[str]:
+
+        return re.findall(r"\b([1-7]\d{3})\b", text)
+
+    def _extract_csts(self, text: str) -> List[str]:
+
+        return re.findall(r"\bCST[\s:]*([0-9]{2})\b", text, flags=re.I)
+
+    def _extract_ncms(self, text: str) -> List[str]:
+
+        return re.findall(r"\b(\d{8})\b", text)
+
+    # =========================================================
+    # REGISTRO COUNTS
+    # =========================================================
+
+    def build_registro_metrics(self):
+
+        counter = Counter()
+
+        for ev in self.evidence:
+
+            reg = ev.get("registro")
+
+            if reg:
+                counter[reg] += 1
+
+        self.metrics["registros"] = dict(counter)
+
+    # =========================================================
+    # CFOP ANALYTICS
+    # =========================================================
+
+    def build_cfop_metrics(self):
+
+        cfop_counter = Counter()
+
+        for ev in self.evidence:
+
+            text = ev.get("text", "")
+
+            cfops = self._extract_cfops(text)
+
+            for cfop in cfops:
+                cfop_counter[cfop] += 1
+
+        self.metrics["cfop_statistics"] = dict(cfop_counter)
+
+    # =========================================================
+    # CST ANALYTICS
+    # =========================================================
+
+    def build_cst_metrics(self):
+
+        cst_counter = Counter()
+
+        for ev in self.evidence:
+
+            text = ev.get("text", "")
+
+            csts = self._extract_csts(text)
+
+            for cst in csts:
+                cst_counter[cst] += 1
+
+        self.metrics["cst_statistics"] = dict(cst_counter)
+
+    # =========================================================
+    # NCM ANALYTICS
+    # =========================================================
+
+    def build_ncm_metrics(self):
+
+        ncms = []
+
+        for ev in self.evidence:
+
+            text = ev.get("text", "")
+
+            found = self._extract_ncms(text)
+
+            ncms.extend(found)
+
+        counter = Counter(ncms)
+
+        inconsistents = []
+
+        for ncm, count in counter.items():
+
+            if count >= 3:
+                inconsistents.append(ncm)
+
+        self.metrics["ncm_inconsistencies"] = {
+            "count": len(inconsistents),
+            "affected_ncms": inconsistents[:30],
+        }
+
+    # =========================================================
+    # CREDIT ANALYSIS
+    # =========================================================
+
+    def build_credit_metrics(self):
+
+        pis_total = 0.0
+        cofins_total = 0.0
+        docs = 0
+
+        for ev in self.evidence:
+
+            text = ev.get("text", "").lower()
+
+            values = self._extract_money_values(text)
+
+            if not values:
+                continue
+
+            if "pis" in text:
+
+                pis_total += sum(values)
+                docs += 1
+
+            if "cofins" in text:
+
+                cofins_total += sum(values)
+                docs += 1
+
+        self.metrics["credit_analysis"] = {
+            "pis_credit_total": round(pis_total, 2),
+            "cofins_credit_total": round(cofins_total, 2),
+            "credit_documents": docs,
+        }
+
+    # =========================================================
+    # C100 x C170
+    # =========================================================
+
+    def build_c100_c170_metrics(self):
+
+        c100_docs = []
+        c170_docs = []
+
+        for ev in self.evidence:
+
+            reg = ev.get("registro")
+
+            if reg == "C100":
+                c100_docs.append(ev)
+
+            elif reg == "C170":
+                c170_docs.append(ev)
+
+        divergences = 0
+        divergence_total = 0.0
+
+        c170_values = []
+
+        for ev in c170_docs:
+
+            vals = self._extract_money_values(
+                ev.get("text", "")
+            )
+
+            c170_values.extend(vals)
+
+        c100_values = []
+
+        for ev in c100_docs:
+
+            vals = self._extract_money_values(
+                ev.get("text", "")
+            )
+
+            c100_values.extend(vals)
+
+        compare_count = min(
+            len(c100_values),
+            len(c170_values)
+        )
+
+        for i in range(compare_count):
+
+            diff = abs(
+                c100_values[i] - c170_values[i]
+            )
+
+            if diff > 0.5:
+
+                divergences += 1
+                divergence_total += diff
+
+        self.metrics["c100_vs_c170"] = {
+            "documents_analyzed": compare_count,
+            "divergent_documents": divergences,
+            "total_divergence": round(divergence_total, 2),
+        }
+
+    # =========================================================
+    # BUILD ALL
+    # =========================================================
+
+    def build_metrics(self):
+
+        self.build_registro_metrics()
+
+        self.build_cfop_metrics()
+
+        self.build_cst_metrics()
+
+        self.build_ncm_metrics()
+
+        self.build_credit_metrics()
+
+        self.build_c100_c170_metrics()
+
+        return self.metrics
+
 def build_analytics(mem: InvestigationMemory) -> Dict[str, Any]:
-    """
-    Camada analítica REAL.
-    Aqui fazemos:
-    - agregações
-    - contagens
-    - cruzamentos
-    - métricas
-    - estatísticas
-    SEM usar LLM.
-    """
 
-    analytics = {
-        "registros": {},
-        "topics": {},
-        "sources": {},
-        "totals": {
-            "evidence_count": len(mem.evidence),
-        }
-    }
+    engine = SpedAnalyticsEngine(
+        mem.evidence
+    )
 
-    # =========================================================
-    # REGISTROS
-    # =========================================================
-
-    for reg, count in mem.registros_covered.items():
-        analytics["registros"][reg] = {
-            "count": count
-        }
+    analytics = engine.build_metrics()
 
     # =========================================================
     # TOPICS
@@ -602,12 +860,16 @@ def build_analytics(mem: InvestigationMemory) -> Dict[str, Any]:
     topic_counter = Counter()
 
     for ev in mem.evidence:
+
         topic = ev.get("topic")
 
         if topic:
             topic_counter[topic] += 1
 
+    analytics["topics"] = {}
+
     for topic, count in topic_counter.items():
+
         analytics["topics"][topic] = {
             "evidence_count": count
         }
@@ -619,6 +881,7 @@ def build_analytics(mem: InvestigationMemory) -> Dict[str, Any]:
     source_counter = Counter()
 
     for ev in mem.evidence:
+
         src = ev.get("source")
 
         if src:
@@ -726,6 +989,13 @@ Regras:
 
 SYNTH_SYS = """
 Você é o SYNTHESIZER fiscal/SPED responsável por produzir relatórios fiscais profissionais em Markdown renderizável via ReactMarkdown.
+
+
+Priorize SEMPRE:
+1. analytics estruturados
+2. métricas quantitativas
+3. agregações
+4. cruzamentos calculados
 
 Responda SOMENTE com o documento final.
 NÃO estime valores.
@@ -919,11 +1189,11 @@ HIPÓTESES INVESTIGADAS:
 LACUNAS CONHECIDAS:
 {json.dumps(mem.gaps, ensure_ascii=False)}
 
-EVIDÊNCIAS (top-{AGENT_COMPRESSION_TOPN}, comprimidas):
-{compressed}
+MÉTRICAS FISCAIS ESTRUTURADAS:
+{json.dumps(analytics, ensure_ascii=False, indent=2)}
 
-ANALYTICS:
-{json.dumps(analytics, ensure_ascii=False)}
+EVIDÊNCIAS QUALITATIVAS:
+{compressed}
 
 Produza AGORA o sumário final em Markdown.
 """
@@ -1028,7 +1298,7 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
                 mem.add_query(q); total_searches += 1
                 # score interno = rank-based
                 for i, d in enumerate(docs):
-                    score = 1.0 - (i / max(len(docs),1))
+                    score = max(0.15,1.0 - (i * 0.07))
                     if mem.add_evidence(d, topic=topic, score=score): round_added += 1
                 mem.mark_topic(topic)
             trace.append({"phase":"investigate","round":round_idx+1,"searches":len(batch),
@@ -1047,7 +1317,7 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
         for g in critique["gaps"]:
             if g and g not in mem.gaps: mem.gaps.append(g)
 
-        if critique["ready"] and len(mem.evidence) >= 5:
+        if critique["ready"] and len(mem.evidence) >= 5 and mem.coverage_score(plan.get("topics", [])) >= AGENT_REFLECTION_THRESHOLD:
             print(f"[ORCH][{job_id}] CRITIC ready=True após round {round_idx+1}")
             break
 
@@ -1070,7 +1340,11 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
                 mem.add_evidence(d, topic="contexto_empresa", score=0.4 - i*0.02)
         except Exception as e:
             print(f"[ORCH][{job_id}] driva opcional falhou: {e}")
-
+            
+    trace.append({
+    "phase": "analytics",
+    "metrics": analytics
+    })
     analytics = build_analytics(mem)
     # ---------- FASE 3: SYNTH ----------
     job_update(job_id, stage="agent_synth", progress=90)
