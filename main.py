@@ -1244,7 +1244,7 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
     u = plan.pop("_usage", {})
     tokens_total["prompt"]     += u.get("prompt_tokens", 0)
     tokens_total["completion"] += u.get("completion_tokens", 0)
-    analytics = build_analytics(mem)
+    
     trace.append({"phase": "plan", "topics": plan["topics"],
                   "registros": plan["registros"], "queries": plan["initial_queries"]})
     print(f"[ORCH][{job_id}] PLAN | topics={len(plan['topics'])} regs={plan['registros']} init_q={len(plan['initial_queries'])}")
@@ -1341,7 +1341,7 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
                 mem.add_evidence(d, topic="contexto_empresa", score=0.4 - i*0.02)
         except Exception as e:
             print(f"[ORCH][{job_id}] driva opcional falhou: {e}")
-            
+
     analytics = build_analytics(mem)       
     trace.append({
     "phase": "analytics",
