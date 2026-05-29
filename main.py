@@ -966,7 +966,11 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
 
     # ---------- FASE 1: PLAN ----------
     job_update(job_id, stage="agent_plan")
-    plan = rule_based_planner(template, objective)
+    plan = planner_agent(
+    template=template,
+    query=objective,
+    model=model_planner,
+    )
     u = plan.pop("_usage", {})
     tokens_total["prompt"]     += u.get("prompt_tokens", 0)
     tokens_total["completion"] += u.get("completion_tokens", 0)
@@ -1269,7 +1273,7 @@ REGRAS:
     structured = parse_summary_markdown(clean_markdown) or {}
 
     final_content = {
-        "visao_geral": structured.get("overview") or "",
+        "visao_geral": structured.get("overview") or clean_markdown,
         "insights": structured.get("insights") or [],
         "inconsistencias": structured.get("inconsistencies") or [],
         "oportunidades": structured.get("opportunities") or [],
