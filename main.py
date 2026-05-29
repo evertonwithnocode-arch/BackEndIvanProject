@@ -1342,11 +1342,12 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
         except Exception as e:
             print(f"[ORCH][{job_id}] driva opcional falhou: {e}")
             
+    analytics = build_analytics(mem)       
     trace.append({
     "phase": "analytics",
     "metrics": analytics
     })
-    analytics = build_analytics(mem)
+    
     # ---------- FASE 3: SYNTH ----------
     job_update(job_id, stage="agent_synth", progress=90)
     final_md, synth_usage = synthesizer_agent(template, periodo, mem, analytics, graph, model=model_synth)
