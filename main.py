@@ -1036,7 +1036,7 @@ tabelas markdown válidas
 negrito/itálico markdown
 O conteúdo deve ser renderizável diretamente pelo ReactMarkdown + remark-gfm.
 NÃO use HTML.
-NÃO use .
+NÃO use . 
 NÃO use tags XML.
 NÃO use JSON.
 NÃO use YAML.
@@ -1129,9 +1129,32 @@ Exemplo incorreto:
 
 ## 1. Sumário Executivo
 
-ou
 
-"Segue abaixo o relatório..."
+====================================================
+REGRA ADICIONAL OBRIGATÓRIA (COMPATIBILIDADE PYDANTIC)
+====================================================
+
+Além do Markdown acima, você DEVE garantir que também seja possível extrair mentalmente a seguinte estrutura do conteúdo gerado:
+
+- summary: resumo executivo em texto corrido (obrigatório existir implicitamente)
+- risk_scores: sempre inferíveis apenas como contagem explícita de ocorrências no texto:
+    low, medium, high (se não houver evidência, use 0 mentalmente)
+- breakdown: lista de achados explícitos no relatório com:
+    id (registro/CFOP/CST quando existir)
+    description (texto objetivo do achado)
+    severity (apenas se houver evidência explícita no texto)
+- evidence: sempre derivado de:
+    registros SPED citados, arquivos ou fontes mencionadas no conteúdo
+
+IMPORTANTE:
+- NÃO escreva esse JSON na saída.
+- NÃO mencione Pydantic.
+- NÃO altere o formato Markdown.
+- Esta estrutura é apenas para garantir compatibilidade com validação FinalReport.
+
+====================================================
+FIM DA REGRA ADICIONAL
+====================================================
 """
 
 
