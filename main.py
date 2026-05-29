@@ -1654,6 +1654,7 @@ class SummaryRequest(BaseModel):
     project_id: str
     agentic: Optional[bool] = True
     model: Optional[str] = None  
+    include_debug: Optional[bool] = False
 
 class EnrichmentRequest(BaseModel):
     project_id: str
@@ -1761,31 +1762,14 @@ REGRAS:
 
     final_content = {
         "visao_geral": structured.get("overview") or clean_markdown,
-        "insights": structured.get("insights") or [],
-        "inconsistencias": structured.get("inconsistencies") or [],
-        "oportunidades": structured.get("opportunities") or [],
-        "analises": structured.get("analyses") or [],
-        "calculos": structured.get("calculations") or {},
-        "cruzamento_de_dados": structured.get("data_crossings") or {},
-        "justificativas": structured.get("justifications") or [],
-        "referencias": structured.get("source_references") or [],
-    }
-
-    final_content = {
-        k: v for k, v in final_content.items()
-        if v not in (None, "", [], {})
     }
 
     if not final_content:
         final_content = {"texto": clean_markdown}
 
-    job_update(
-        job_id,
-        status="completed",
-        stage="done",
-        progress=100,
-        result={
-            "summary": final_content,
+    result_payload = {"summary": final_content}
+    if req.include_debug:
+        result_payload.update({
             "mode": "legacy_oneshot",
             "model": model_synth,
             "model_used": model_synth,
@@ -1794,7 +1778,14 @@ REGRAS:
             "completion_tokens": ct,
             "generation_time_ms": int((time.time() - t_start) * 1000),
             "periodo_detectado": periodo,
-        },
+        })
+
+    job_update(
+        job_id,
+        status="completed",
+        stage="done",
+        progress=100,
+        result=result_payload,
     )
 
 
@@ -1844,37 +1835,16 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
                 print(f"[SUMMARY][{job_id}] RAW_MD_LEN => {len(raw_markdown)}")
 
-                structured = parse_summary_markdown(raw_markdown) or {}
-
                 final_content = {
-                 # ⭐ PRINCIPAL
-                 "visao_geral": raw_markdown,
-
-                 # auxiliares
-                 "insights": structured.get("insights") or [],
-                 "calculos": structured.get("calculations") or [],
-                 "cruzamento_de_dados": structured.get("data_crossings") or [],
-                 "referencias": structured.get("source_references") or [],
+                    "visao_geral": raw_markdown,
                 }
 
-                final_content = {
-                    k: v for k, v in final_content.items()
-                    if v not in (None, "", [], {})
-                }
                 print(f"[SUMMARY][{job_id}] FINAL_CONTENT_KEYS => {list(final_content.keys())}")
 
                 tokens = out.get("tokens") or {}
-
-                job_update(
-                    job_id,
-                    status="completed",
-                    stage="done",
-                    progress=100,
-                    result={
-                        # O frontend salva SOMENTE rawResult.summary em summaries.content
-                        "summary": final_content,
-
-                        # Metadados ficam fora do JSON visual do sumário
+                result_payload = {"summary": final_content}
+                if req.include_debug:
+                    result_payload.update({
                         "mode": "agentic_v2",
                         "analytics": out.get("analytics"),
                         "structured_analysis": out.get("structured_analysis"),
@@ -1885,7 +1855,14 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                         "completion_tokens": tokens.get("completion"),
                         "generation_time_ms": out.get("elapsed_ms"),
                         "periodo_detectado": out.get("periodo"),
-                    },
+                    })
+
+                job_update(
+                    job_id,
+                    status="completed",
+                    stage="done",
+                    progress=100,
+                    result=result_payload,
                 )
 
                 print(
