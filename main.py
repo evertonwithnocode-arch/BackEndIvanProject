@@ -252,7 +252,7 @@ def get_vector_store(project_id: str):
 # ==============================================================================
 # SPED HELPERS (preservado + tabela de relações entre registros)
 # ==============================================================================
-SPED_REGISTRO_REGEX = re.compile(r"^\|\s*([0-9A-Z]{3,4})\s*\|", re.MULTILINE)
+SPED_REGISTRO_REGEX = re.compile(r"^\|([0-9A-Z]{4})\|", re.MULTILINE)
 SPED_0000_REGEX = re.compile(r"\|0000\|[^|]*\|[^|]*\|(\d{8})\|(\d{8})\|", re.MULTILINE)
 
 # Grafo de relações conhecidas entre registros — usado pelo EvidenceGraph
@@ -1036,7 +1036,7 @@ tabelas markdown válidas
 negrito/itálico markdown
 O conteúdo deve ser renderizável diretamente pelo ReactMarkdown + remark-gfm.
 NÃO use HTML.
-NÃO use . 
+NÃO use .
 NÃO use tags XML.
 NÃO use JSON.
 NÃO use YAML.
@@ -1129,32 +1129,9 @@ Exemplo incorreto:
 
 ## 1. Sumário Executivo
 
+ou
 
-====================================================
-REGRA ADICIONAL OBRIGATÓRIA (COMPATIBILIDADE PYDANTIC)
-====================================================
-
-Além do Markdown acima, você DEVE garantir que também seja possível extrair mentalmente a seguinte estrutura do conteúdo gerado:
-
-- summary: resumo executivo em texto corrido (obrigatório existir implicitamente)
-- risk_scores: sempre inferíveis apenas como contagem explícita de ocorrências no texto:
-    low, medium, high (se não houver evidência, use 0 mentalmente)
-- breakdown: lista de achados explícitos no relatório com:
-    id (registro/CFOP/CST quando existir)
-    description (texto objetivo do achado)
-    severity (apenas se houver evidência explícita no texto)
-- evidence: sempre derivado de:
-    registros SPED citados, arquivos ou fontes mencionadas no conteúdo
-
-IMPORTANTE:
-- NÃO escreva esse JSON na saída.
-- NÃO mencione Pydantic.
-- NÃO altere o formato Markdown.
-- Esta estrutura é apenas para garantir compatibilidade com validação FinalReport.
-
-====================================================
-FIM DA REGRA ADICIONAL
-====================================================
+"Segue abaixo o relatório..."
 """
 
 
@@ -1225,15 +1202,12 @@ Produza AGORA o sumário final em Markdown.
         messages=[{"role": "system", "content": SYNTH_SYS},
                   {"role": "user", "content": user}],
         temperature=0.2,
-        response_format={"type": "json_object"}
     )
     usage = {
         "prompt_tokens":     resp.usage.prompt_tokens if resp.usage else 0,
         "completion_tokens": resp.usage.completion_tokens if resp.usage else 0,
     }
-    content = json.loads(resp.choices[0].message.content or "{}")
-
-    return content, usage
+    return resp.choices[0].message.content or "", usage
 
 
 # ==============================================================================
@@ -1263,22 +1237,16 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
     # ---------- FASE 1: PLAN ----------
     job_update(job_id, stage="agent_plan")
     plan = planner_agent(
-        template=template,
-        query=objective,
-        model=model_planner,
+    template=template,
+    query=objective,
+    model=model_planner,
     )
-
     u = plan.pop("_usage", {})
     tokens_total["prompt"]     += u.get("prompt_tokens", 0)
     tokens_total["completion"] += u.get("completion_tokens", 0)
-
-    trace.append({
-        "phase": "plan",
-        "topics": plan["topics"],
-        "registros": plan["registros"],
-        "queries": plan["initial_queries"]
-    })
-
+    
+    trace.append({"phase": "plan", "topics": plan["topics"],
+                  "registros": plan["registros"], "queries": plan["initial_queries"]})
     print(f"[ORCH][{job_id}] PLAN | topics={len(plan['topics'])} regs={plan['registros']} init_q={len(plan['initial_queries'])}")
 
     mem = InvestigationMemory()
@@ -1288,195 +1256,122 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
         if isinstance(h, dict) and h.get("topic"):
             mem.add_hypothesis(h["topic"], h.get("note",""))
 
-    # período fiscal
+    # período fiscal (1 vez)
     try:
-        per_docs = hybrid_search(
-            project_id,
-            "0000 abertura período DT_INI DT_FIN CNPJ",
-            k=6,
-            source_kind="sped"
-        )
+        per_docs = hybrid_search(project_id, "0000 abertura período DT_INI DT_FIN CNPJ", k=6, source_kind="sped")
         periodo = extract_periodo_from_docs(per_docs)
     except Exception:
         periodo = None
 
     # ---------- FASE 2: INVESTIGATOR LOOP ----------
-    pending_queries: List[Tuple[str, Optional[str], str]] = []
-
+    pending_queries: List[Tuple[str,Optional[str],str]] = []  # (query, registro, topic)
+    # bootstrap com initial_queries + ancoradas em registros do plano
     for q in plan.get("initial_queries", [])[:AGENT_SEARCHES_PER_ROUND*2]:
         pending_queries.append((q, None, q))
-
     for reg in plan.get("registros", [])[:6]:
         pending_queries.append((f"{reg} apuração valores totais", reg, f"reg_{reg}"))
 
     total_searches = 0
-
     for round_idx in range(AGENT_MAX_ROUNDS):
-        if not pending_queries:
-            break
-        if total_searches >= AGENT_MAX_SEARCHES_TOTAL:
-            break
+        if not pending_queries: break
+        if total_searches >= AGENT_MAX_SEARCHES_TOTAL: break
 
-        batch: List[Tuple[str, Optional[str], str]] = []
-
+        # seleciona até N queries não-repetidas
+        batch: List[Tuple[str,Optional[str],str]] = []
         while pending_queries and len(batch) < AGENT_SEARCHES_PER_ROUND:
             q, reg, topic = pending_queries.pop(0)
-
-            if mem.has_query(q):
-                continue
-            if total_searches + len(batch) >= AGENT_MAX_SEARCHES_TOTAL:
-                break
-
+            if mem.has_query(q): continue
+            if total_searches + len(batch) >= AGENT_MAX_SEARCHES_TOTAL: break
             batch.append((q, reg, topic))
 
-        if batch:
+        if not batch:
+            # nada novo p/ buscar → vai para crítico decidir
+            pass
+        else:
             job_update(job_id, stage=f"agent_round_{round_idx+1}", progress=10 + round_idx*12)
-
-            tasks = [(project_id, q, AGENT_DEFAULT_K, reg, topic)
-                     for (q, reg, topic) in batch]
-
+            # busca paralela
+            tasks = [(project_id, q, AGENT_DEFAULT_K, reg, topic) for (q,reg,topic) in batch]
             with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as ex:
                 results = list(ex.map(_run_search_task, tasks))
 
             round_added = 0
-
             for (q, docs, topic) in results:
-                mem.add_query(q)
-                total_searches += 1
-
+                mem.add_query(q); total_searches += 1
+                # score interno = rank-based
                 for i, d in enumerate(docs):
-                    score = max(0.15, 1.0 - (i * 0.07))
-                    if mem.add_evidence(d, topic=topic, score=score):
-                        round_added += 1
-
+                    score = max(0.15,1.0 - (i * 0.07))
+                    if mem.add_evidence(d, topic=topic, score=score): round_added += 1
                 mem.mark_topic(topic)
-
-            trace.append({
-                "phase": "investigate",
-                "round": round_idx + 1,
-                "searches": len(batch),
-                "new_evidence": round_added,
-                "total_evidence": len(mem.evidence)
-            })
-
+            trace.append({"phase":"investigate","round":round_idx+1,"searches":len(batch),
+                          "new_evidence":round_added,"total_evidence":len(mem.evidence)})
             print(f"[ORCH][{job_id}] round {round_idx+1} | searches={len(batch)} +ev={round_added} totev={len(mem.evidence)}")
 
+        # atualiza grafo após cada rodada
         graph.ingest(mem)
 
-        # ----- CRITIC -----
+        # ----- REFLECTION / CRITIC -----
         job_update(job_id, stage=f"agent_critic_{round_idx+1}")
-
         critique = critic_agent(plan, mem, graph, model=model_critic)
-
-        u = critique.pop("_usage", {})
-        tokens_total["prompt"]     += u.get("prompt_tokens", 0)
-        tokens_total["completion"] += u.get("completion_tokens", 0)
-
-        trace.append({
-            "phase": "critic",
-            "round": round_idx + 1,
-            "ready": critique["ready"],
-            "gaps": critique["gaps"][:5],
-            "reasoning": critique["reasoning"]
-        })
-
+        u = critique.pop("_usage", {}); tokens_total["prompt"]+=u.get("prompt_tokens",0); tokens_total["completion"]+=u.get("completion_tokens",0)
+        trace.append({"phase":"critic","round":round_idx+1,"ready":critique["ready"],
+                      "gaps":critique["gaps"][:5],"reasoning":critique["reasoning"]})
         for g in critique["gaps"]:
-            if g and g not in mem.gaps:
-                mem.gaps.append(g)
+            if g and g not in mem.gaps: mem.gaps.append(g)
 
-        if (
-            critique["ready"]
-            and len(mem.evidence) >= 5
-            and mem.coverage_score(plan.get("topics", [])) >= AGENT_REFLECTION_THRESHOLD
-        ):
+        if critique["ready"] and len(mem.evidence) >= 5 and mem.coverage_score(plan.get("topics", [])) >= AGENT_REFLECTION_THRESHOLD:
             print(f"[ORCH][{job_id}] CRITIC ready=True após round {round_idx+1}")
             break
 
+        # alimenta próxima rodada com refinamentos
         for q in critique.get("refined_queries", [])[:AGENT_SEARCHES_PER_ROUND]:
-            if q and not mem.has_query(q):
-                pending_queries.append((q, None, q))
-
+            if q and not mem.has_query(q): pending_queries.append((q, None, q))
         for r in critique.get("target_registros", [])[:3]:
             pending_queries.append((f"{r} valores apuração detalhamento", r, f"reg_{r}"))
 
+        # sugere registros conectados ainda não cobertos (grafo)
         for r in graph.suggest_next_registros(mem, top=2):
             pending_queries.append((f"{r} ajustes débitos créditos", r, f"graph_{r}"))
 
-    # ---------- DRIVA ----------
+    # ---------- Driva (opcional, 1 chamada compacta) ----------
     if plan.get("needs_driva"):
         try:
-            d_docs = hybrid_search(
-                project_id,
-                "porte regime tributário CNAE sócios atividade",
-                k=5,
-                source_kind="driva"
-            )
-
-            for i, d in enumerate(d_docs):
+            d_docs = hybrid_search(project_id, "porte regime tributário CNAE sócios atividade",
+                                   k=5, source_kind="driva")
+            for i,d in enumerate(d_docs):
                 mem.add_evidence(d, topic="contexto_empresa", score=0.4 - i*0.02)
-
         except Exception as e:
             print(f"[ORCH][{job_id}] driva opcional falhou: {e}")
-
+            
+    trace.append({
+    "phase": "analytics",
+    "metrics": analytics
+    })
     analytics = build_analytics(mem)
-
-    trace.append({
-        "phase": "analytics",
-        "metrics": analytics
-    })
-
-    # ---------- SYNTH ----------
+    # ---------- FASE 3: SYNTH ----------
     job_update(job_id, stage="agent_synth", progress=90)
+    final_md, synth_usage = synthesizer_agent(template, periodo, mem, analytics, graph, model=model_synth)
+    tokens_total["prompt"]+=synth_usage.get("prompt_tokens",0)
+    tokens_total["completion"]+=synth_usage.get("completion_tokens",0)
+    trace.append({"phase":"synth","prompt_tokens":synth_usage.get("prompt_tokens",0),
+                  "completion_tokens":synth_usage.get("completion_tokens",0)})
 
-    synth_out, synth_usage = synthesizer_agent(
-       template,
-       periodo,
-       mem,
-       analytics,
-       graph,
-       model=model_synth
-    )
-
-    tokens_total["prompt"]     += synth_usage.get("prompt_tokens", 0)
-    tokens_total["completion"] += synth_usage.get("completion_tokens", 0)
-
-    # 🔥 FIX CRÍTICO: parse + validação forte
-    if isinstance(synth_out, str):
-        try:
-            final_json = json.loads(synth_out)
-        except Exception:
-            raise ValueError(f"Synth retornou JSON inválido: {synth_out[:300]}")
-    elif isinstance(synth_out, dict):
-        final_json = synth_out
-    else:
-        raise ValueError(f"Synth retornou tipo inválido: {type(synth_out)}")
-
-    final_report = FinalReport.model_validate(final_json)
-    
-    trace.append({
-        "phase": "synth",
-        "prompt_tokens": synth_usage.get("prompt_tokens", 0),
-        "completion_tokens": synth_usage.get("completion_tokens", 0)
-    })
-
-    elapsed_ms = int((time.time() - t0) * 1000)
-
+    elapsed_ms = int((time.time()-t0)*1000)
     return {
-        "final_report": final_report.model_dump(),
-        "periodo": periodo,
+        "markdown":     final_md,
+        "periodo":      periodo,
         "analytics": analytics,
         "tokens": {
-            "prompt": tokens_total["prompt"],
+            "prompt":     tokens_total["prompt"],
             "completion": tokens_total["completion"],
-            "total": tokens_total["prompt"] + tokens_total["completion"],
+            "total":      tokens_total["prompt"]+tokens_total["completion"],
         },
-        "elapsed_ms": elapsed_ms,
-        "plan": {k: v for k, v in plan.items() if not k.startswith("_")},
-        "memory": mem.snapshot(),
-        "graph": graph.export(),
-        "searches": total_searches,
-        "model": model_synth,
-        "trace": trace,
+        "elapsed_ms":   elapsed_ms,
+        "plan":         {k:v for k,v in plan.items() if not k.startswith("_")},
+        "memory":       mem.snapshot(),
+        "graph":        graph.export(),
+        "searches":     total_searches,
+        "model":        model_synth,
+        "trace":        trace,
     }
 
 
@@ -1539,27 +1434,6 @@ def parse_summary_markdown(md: str) -> Dict[str, List[Any]]:
 # ==============================================================================
 # MODELS
 # ==============================================================================
-class RiskItem(BaseModel):
-    id: str
-    description: str
-    severity: str
-
-class RiskScores(BaseModel):
-    low: int
-    medium: int
-    high: int
-
-class EvidenceSummary(BaseModel):
-    sources: List[str]
-    total_chunks: int
-
-class FinalReport(BaseModel):
-    summary: str
-    risk_scores: RiskScores
-    breakdown: List[RiskItem]
-    evidence: EvidenceSummary
-    debug: Optional[Dict[str, Any]] = None
-
 class SummaryRequest(BaseModel):
     template: str
     query: Optional[str] = "gerar sumário geral"
@@ -1582,33 +1456,6 @@ class ProcessPathsRequest(BaseModel):
 # ==============================================================================
 # INDEXAÇÃO (preservada)
 # ==============================================================================
-SYNTH_SYS_JSON = """
-Você deve retornar APENAS JSON válido no seguinte formato:
-
-{
-  "summary": "...",
-  "risk_scores": {
-    "low": 0,
-    "medium": 0,
-    "high": 0
-  },
-  "breakdown": [
-    {
-      "id": "...",
-      "description": "...",
-      "severity": "low|medium|high"
-    }
-  ],
-  "evidence": {
-    "sources": [],
-    "total_chunks": 0
-  },
-  "debug": {}
-}
-
-NÃO retorne markdown. NÃO explique. SOMENTE JSON.
-"""
-
 def process_job(job_id: str, files_data: List[dict], project_id: str):
     try:
         t0=time.time()
@@ -1779,34 +1626,22 @@ def process_summary_job(job_id: str, req: SummaryRequest):
         if req.agentic:
             try:
                 out = orchestrate_summary(req, job_id)
-                final_json = out["final_report"]
+                raw_markdown = _strip_md_fences(out.get("markdown", "") or "")
+                print(f"[SUMMARY][{job_id}] RAW_MARKDOWN_EMPTY => {not bool(raw_markdown.strip())}")
 
-                final_report = FinalReport.model_validate(final_json)
-                
-                structured = {}
+                print(f"[SUMMARY][{job_id}] RAW_MD_LEN => {len(raw_markdown)}")
+
+                structured = parse_summary_markdown(raw_markdown) or {}
 
                 final_content = {
                  # ⭐ PRINCIPAL
-                 "visao_geral": final_report.summary,
-                 "risco": {
-                 "low": final_report.risk_scores.low,
-                 "medium": final_report.risk_scores.medium,
-                 "high": final_report.risk_scores.high,
-                },
-
-                "breakdown": [
-                    b.model_dump() for b in final_report.breakdown
-                ],
-                "evidencia": final_report.evidence.model_dump(),
-
-                
+                 "visao_geral": raw_markdown,
 
                  # auxiliares
                  "insights": structured.get("insights") or [],
                  "calculos": structured.get("calculations") or [],
                  "cruzamento_de_dados": structured.get("data_crossings") or [],
                  "referencias": structured.get("source_references") or [],
-                 "debug": final_report.debug or {}
                 }
 
                 final_content = {
@@ -1827,7 +1662,7 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                         "summary": final_content,
 
                         # Metadados ficam fora do JSON visual do sumário
-                        "mode": "agentic_v3_contract",
+                        "mode": "agentic_v2",
                         "analytics": out.get("analytics"),
                         "model": out.get("model"),
                         "model_used": out.get("model"),
