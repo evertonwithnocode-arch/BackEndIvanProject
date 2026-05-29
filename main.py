@@ -693,24 +693,102 @@ Regras:
 - Prefira refinar (sinônimos, código de registro, CFOP/CST) em vez de repetir.
 """
 
-SYNTH_SYS = """Você é o SYNTHESIZER fiscal/SPED. Recebe:
-- Template original do usuário
-- Período fiscal
-- Evidências comprimidas (top-N por relevância, com fonte/registro/score)
-- Grafo de cruzamentos detectados
-- Hipóteses (open/confirmed/rejected) e lacunas
+SYNTH_SYS = """
+Você é o SYNTHESIZER fiscal/SPED responsável por produzir relatórios fiscais profissionais em Markdown renderizável via ReactMarkdown.
 
-Tarefa: produzir o SUMÁRIO FINAL em Markdown, obedecendo ESTRITAMENTE o template.
+Responda SOMENTE com o documento final.
+NÃO explique seu raciocínio.
+NÃO explique sua função.
+NÃO repita instruções recebidas.
+NÃO repita prompts do sistema.
+NÃO escreva introduções como:
+"Claro", "Segue abaixo", "Aqui está o relatório", etc.
 
-Regras inegociáveis:
-1. NÃO invente números. Toda afirmação numérica/fiscal cita arquivo + registro.
-2. Se NÃO houver evidência para um item, OMITA-o (NÃO escreva "Dado não disponível").
-3. Driva = contexto de negócio; nunca evidência numérica.
-4. Registro 0450 = informação complementar, não usar para ROI.
-5. Use o período fiscal fornecido em qualquer menção a período.
-6. Substitua placeholders "X.N" pelo número real do capítulo.
-7. Sempre que cruzar 2+ registros, explique a relação (use o grafo).
-8. Markdown limpo, com headings hierárquicos e tabelas só com dados reais.
+NÃO envolva a resposta em blocos:
+
+
+
+
+ou qualquer cerca de código.
+
+Retorne Markdown PURO.
+Use apenas:
+headings markdown (## ### ####)
+listas markdown
+tabelas markdown válidas
+negrito/itálico markdown
+O conteúdo deve ser renderizável diretamente pelo ReactMarkdown + remark-gfm.
+NÃO use HTML.
+NÃO use .
+NÃO use tags XML.
+NÃO use JSON.
+NÃO use YAML.
+NÃO use backticks triplos em nenhuma circunstância.
+
+Você receberá:
+
+Template original do usuário
+Período fiscal
+Evidências comprimidas (top-N)
+Grafo de cruzamentos detectados
+Hipóteses investigadas
+Lacunas conhecidas
+
+Produzir o SUMÁRIO FINAL obedecendo ESTRITAMENTE o template solicitado.
+
+NÃO invente números.
+Toda afirmação numérica/fiscal deve estar baseada em evidências reais.
+Sempre que possível, cite:
+arquivo
+registro SPED
+CFOP/CST/NCM relevantes
+Se NÃO houver evidência suficiente:
+OMITA o item
+NÃO escreva:
+"Dado não disponível"
+"Informação insuficiente"
+placeholders vazios
+Dados da Driva:
+servem apenas como contexto empresarial
+nunca como prova numérica/fiscal
+Registro 0450:
+é apenas informação complementar
+não utilizar para cálculos de ROI ou créditos
+Sempre utilize o período fiscal informado.
+Sempre que cruzar múltiplos registros:
+explique claramente a relação entre eles
+Substitua placeholders como:
+X.N
+Capítulo X
+Seção X
+por numeração real.
+Linguagem técnica e profissional.
+Objetiva.
+Sem redundância.
+Sem repetir evidências iguais.
+Sem repetir tabelas similares.
+Priorize clareza executiva.
+Use tabelas apenas quando agregarem valor real.
+
+A resposta final deve começar DIRETAMENTE no conteúdo do relatório.
+
+Exemplo correto:
+
+1. Sumário Executivo
+
+Texto...
+
+2. Créditos de PIS/COFINS
+
+Tabela...
+
+Exemplo incorreto:
+
+## 1. Sumário Executivo
+
+ou
+
+"Segue abaixo o relatório..."
 """
 
 
@@ -1104,11 +1182,12 @@ REGRAS:
 
     with get_openai_callback() as cb:
         resp = llm.invoke(prompt)
+        clean_markdown = _strip_md_fences(resp.content)
         tok = cb.total_tokens
         pt = cb.prompt_tokens
         ct = cb.completion_tokens
 
-    structured = parse_summary_markdown(resp.content) or {}
+    structured = parse_summary_markdown(clean_markdown) or {}
 
     final_content = {
         "visao_geral": structured.get("overview") or "",
@@ -1128,7 +1207,7 @@ REGRAS:
     }
 
     if not final_content:
-        final_content = {"texto": resp.content}
+        final_content = {"texto": clean_markdown}
 
     job_update(
         job_id,
@@ -1149,6 +1228,32 @@ REGRAS:
     )
 
 
+def _strip_md_fences(text: str) -> str:
+    """
+    Remove cercas markdown ```markdown ... ```
+    quando o modelo embrulha TODA a resposta em code block.
+    """
+
+    if not isinstance(text, str):
+        return text
+
+    t = text.strip()
+
+    # remove bloco completo ```lang ... ```
+    m = re.match(
+        r"^```(?:markdown|md|text)?\s*\n(.*)\n```$",
+        t,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    if m:
+        return m.group(1).strip()
+
+    # fallback
+    t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+    t = re.sub(r"\s*```$", "", t)
+
+    return t.strip()
 
 def process_summary_job(job_id: str, req: SummaryRequest):
     t0 = time.time()
@@ -1163,7 +1268,7 @@ def process_summary_job(job_id: str, req: SummaryRequest):
         if req.agentic:
             try:
                 out = orchestrate_summary(req, job_id)
-                raw_markdown = out.get("markdown", "") or ""
+                raw_markdown = _strip_md_fences(out.get("markdown", "") or "")
                 print(f"[SUMMARY][{job_id}] RAW_MARKDOWN_EMPTY => {not bool(raw_markdown.strip())}")
 
                 print(f"[SUMMARY][{job_id}] RAW_MD_LEN => {len(raw_markdown)}")
