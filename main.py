@@ -930,7 +930,8 @@ def critic_agent(plan: Dict[str, Any], mem: InvestigationMemory,
 
 
 def synthesizer_agent(template: str, periodo: Optional[str],
-                      mem: InvestigationMemory, graph: EvidenceGraph,
+                      mem: InvestigationMemory,
+                       analytics: Dict[str, Any], graph: EvidenceGraph,
                       model: str) -> Tuple[str, Dict[str, int]]:
     compressed = compress_context(mem.evidence, AGENT_COMPRESSION_TOPN)
     user = f"""PERÍODO FISCAL: {periodo or 'não detectado'}
@@ -948,6 +949,9 @@ HIPÓTESES INVESTIGADAS:
 
 LACUNAS CONHECIDAS:
 {json.dumps(mem.gaps, ensure_ascii=False)}
+
+EVIDÊNCIAS (top-{AGENT_COMPRESSION_TOPN}, comprimidas):
+{compressed}
 
 ANALYTICS:
 {json.dumps(analytics, ensure_ascii=False)}
@@ -1107,6 +1111,7 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
     return {
         "markdown":     final_md,
         "periodo":      periodo,
+        "analytics": analytics,
         "tokens": {
             "prompt":     tokens_total["prompt"],
             "completion": tokens_total["completion"],
@@ -1410,6 +1415,7 @@ def process_summary_job(job_id: str, req: SummaryRequest):
 
                         # Metadados ficam fora do JSON visual do sumário
                         "mode": "agentic_v2",
+                        "analytics": out.get("analytics"),
                         "model": out.get("model"),
                         "model_used": out.get("model"),
                         "tokens_used": tokens.get("total"),
