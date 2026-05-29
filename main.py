@@ -1,4 +1,3 @@
-from collections import defaultdict
 from decimal import Decimal
 import re
 import json
@@ -890,6 +889,102 @@ def build_analytics(mem: InvestigationMemory) -> Dict[str, Any]:
     analytics["sources"] = dict(source_counter)
 
     return analytics
+
+# ==============================================================================
+# MONOLITHIC DETERMINISTIC ANALYSIS ENGINE
+# ==============================================================================
+# Tudo fica no main.py: calculos, financeiro, juridico, BI, scoring e schema final.
+# O LLM recebe apenas o JSON calculado e gera narrativa.
+
+MATERIALITY_THRESHOLDS = {"HIGH": Decimal("100000.00"), "MEDIUM": Decimal("25000.00")}
+LEGAL_RULE_DATABASE = [
+    {"terms": ("PIS", "COFINS", "M100", "M500"), "law": "Lei 10.833/2003", "article": "Art. 3", "context": "Creditamento PIS/COFINS"},
+    {"terms": ("ICMS", "E110", "E111", "C190"), "law": "LC 87/1996", "article": "Arts. 19 a 23", "context": "Apuracao e creditos de ICMS"},
+    {"terms": ("C100", "C170", "C190"), "law": "Ajuste SINIEF 02/2009", "article": "Leiaute EFD", "context": "Consistencia documento/item/totalizador"},
+    {"terms": ("NCM", "0200", "C170"), "law": "TIPI/NCM vigente", "article": "RGI-SH", "context": "Classificacao fiscal"},
+]
+
+def _to_decimal(value: Any, default: str = "0") -> Decimal:
+    try:
+        if isinstance(value, Decimal): return value
+        s = str(value or "").strip().replace("R$", "").replace(" ", "")
+        if not s: return Decimal(default)
+        if "," in s: s = s.replace(".", "").replace(",", ".")
+        return Decimal(s)
+    except Exception:
+        return Decimal(default)
+
+def _money_float(value: Decimal) -> float:
+    return float(value.quantize(Decimal("0.01")))
+
+def _risk_level(score: float) -> str:
+    return "HIGH" if score >= 75 else "MEDIUM" if score >= 45 else "LOW"
+
+def _materiality_level(amount: Decimal) -> str:
+    return "HIGH" if amount >= MATERIALITY_THRESHOLDS["HIGH"] else "MEDIUM" if amount >= MATERIALITY_THRESHOLDS["MEDIUM"] else "LOW"
+
+def _extract_decimal_values(text: str) -> List[Decimal]:
+    return [_to_decimal(x) for x in re.findall(r"(?:R\$\s*)?\d{1,3}(?:\.\d{3})*,\d{2}|\b\d+\.\d{2}\b", text or "")]
+
+def normalize_sped_data(evidence: List[Dict[str, Any]]) -> Dict[str, Any]:
+    records, by_register = [], defaultdict(list)
+    for ev in evidence or []:
+        raw = ev.get("text", "") or ""
+        reg = ev.get("registro") or primary_registro(raw) or "unknown"
+        parsed = {"money_values": _extract_decimal_values(raw), "cfops": re.findall(r"\b([1-7]\d{3})\b", raw), "csts": re.findall(r"\bCST[\s:]*([0-9]{2})\b", raw, flags=re.I), "ncms": re.findall(r"\b(\d{8})\b", raw)}
+        rec = {"source": ev.get("source", "unknown"), "registro": reg, "topic": ev.get("topic", "geral"), "chunk": ev.get("chunk"), "score": float(ev.get("score") or 0), "text": raw[:AGENT_MAX_CHUNK_CHARS], "parsed": parsed}
+        records.append(rec); by_register[reg].append(rec)
+    return {"records": records, "by_register": dict(by_register), "record_count": len(records), "register_count": len(by_register)}
+
+def run_deterministic_analysis(normalized: Dict[str, Any]) -> Dict[str, Any]:
+    amounts, cfops, csts, ncms = defaultdict(lambda: Decimal("0")), Counter(), Counter(), Counter()
+    total, findings = Decimal("0"), []
+    for rec in normalized.get("records", []):
+        vals = rec["parsed"].get("money_values", [])
+        subtotal = sum(vals, Decimal("0")); total += subtotal; amounts[rec["registro"]] += subtotal
+        cfops.update(rec["parsed"].get("cfops", [])); csts.update(rec["parsed"].get("csts", [])); ncms.update(rec["parsed"].get("ncms", []))
+    c100, c170 = amounts.get("C100", Decimal("0")), amounts.get("C170", Decimal("0"))
+    diff = abs(c100 - c170)
+    if c100 and c170 and diff > Decimal("0.50"):
+        findings.append({"finding": "Divergencia agregada C100/C170", "source_registers": ["C100", "C170"], "documents_affected": len(normalized.get("by_register", {}).get("C100", [])), "calculation_method": "abs(sum(C100) - sum(C170))", "amount": _money_float(diff), "confidence_score": 0.72})
+    recurrent_ncms = [n for n, c in ncms.items() if c >= 3]
+    if recurrent_ncms:
+        findings.append({"finding": "NCMs recorrentes para revisao", "source_registers": ["0200", "C170"], "documents_affected": len(recurrent_ncms), "calculation_method": "count(NCM) >= 3", "affected_ncms": recurrent_ncms[:20], "confidence_score": 0.68})
+    count = max(normalized.get("record_count", 0), 1)
+    confidence = round(min(1, count / 40) * 0.40 + min(1, len(cfops) / 10) * 0.25 + (1 - min(1, len(findings) / count)) * 0.25 + (0.10 if total else 0.02), 2)
+    return {"totals": {"records_analyzed": normalized.get("record_count", 0), "registers_analyzed": normalized.get("register_count", 0), "monetary_volume_detected": _money_float(total), "amount_by_register": {k: _money_float(v) for k, v in sorted(amounts.items())}}, "cross_validations": {"c100_total": _money_float(c100), "c170_total": _money_float(c170), "c100_c170_difference": _money_float(diff)}, "tax_indicators": {"top_cfops": cfops.most_common(20), "top_csts": csts.most_common(20), "top_ncms": ncms.most_common(20)}, "findings": findings, "confidence_score": confidence}
+
+def calculate_financial_summary(deterministic: Dict[str, Any]) -> Dict[str, Any]:
+    volume = _to_decimal(deterministic.get("totals", {}).get("monetary_volume_detected")); diff = _to_decimal(deterministic.get("cross_validations", {}).get("c100_c170_difference"))
+    credit_base = volume * Decimal("0.0925") if volume else Decimal("0"); exposure = max(diff, credit_base * Decimal("0.15"))
+    return {"estimated_tax_exposure": _money_float(exposure), "annual_projection": _money_float(exposure * Decimal("12")), "materiality_level": _materiality_level(exposure), "estimated_recoverable_amount": _money_float(credit_base * Decimal("0.30")), "confidence_level": round(float(deterministic.get("confidence_score") or 0.1), 2), "calculation_methods": {"estimated_tax_exposure": "max(C100/C170 difference, monetary_volume * 9.25% * 15%)", "annual_projection": "estimated_tax_exposure * 12", "estimated_recoverable_amount": "monetary_volume * 9.25% * 30%"}}
+
+def run_legal_analysis(normalized: Dict[str, Any], deterministic: Dict[str, Any]) -> Dict[str, Any]:
+    haystack = " ".join((r.get("registro", "") + " " + r.get("text", "")[:300]) for r in normalized.get("records", [])).upper()
+    laws = [{"law": r["law"], "article": r["article"], "context": r["context"], "matched_terms": [t for t in r["terms"] if t.upper() in haystack]} for r in LEGAL_RULE_DATABASE if any(t.upper() in haystack for t in r["terms"])]
+    if not laws: laws = [{"law": "SPED/EFD", "article": "Leiaute aplicavel", "context": "Validacao dos registros extraidos", "matched_terms": sorted(normalized.get("by_register", {}).keys())[:8]}]
+    risk = min(100, 35 + len(deterministic.get("findings", [])) * 12 + len(laws) * 4)
+    return {"applicable_laws": laws, "litigation_risk": _risk_level(risk), "defensibility_score": max(0, 100 - risk + int((deterministic.get("confidence_score") or 0) * 25)), "legal_confidence": round(float(deterministic.get("confidence_score") or 0.1), 2)}
+
+def build_business_intelligence(deterministic: Dict[str, Any], analytics: Dict[str, Any]) -> Dict[str, Any]:
+    ind = deterministic.get("tax_indicators", {}); amounts = deterministic.get("totals", {}).get("amount_by_register", {})
+    return {"top_ncms": ind.get("top_ncms", [])[:10], "top_cfops": ind.get("top_cfops", [])[:10], "top_csts": ind.get("top_csts", [])[:10], "top_registers_by_value": sorted(amounts.items(), key=lambda x: x[1], reverse=True)[:10], "sources": analytics.get("sources", {}), "topics": analytics.get("topics", {})}
+
+def calculate_scores(financial: Dict[str, Any], legal: Dict[str, Any], deterministic: Dict[str, Any]) -> Dict[str, Any]:
+    materiality = 95 if financial.get("materiality_level") == "HIGH" else 65 if financial.get("materiality_level") == "MEDIUM" else 30
+    divergence = min(100, float(_to_decimal(deterministic.get("cross_validations", {}).get("c100_c170_difference"))) / 1000)
+    recurrence = min(100, len(deterministic.get("tax_indicators", {}).get("top_cfops", [])) * 5)
+    legal_score = 80 if legal.get("litigation_risk") == "HIGH" else 55 if legal.get("litigation_risk") == "MEDIUM" else 25
+    overall = divergence * 0.25 + materiality * 0.25 + recurrence * 0.15 + legal_score * 0.20 + float(financial.get("confidence_level") or 0) * 100 * 0.15
+    return {"overall_risk_score": int(round(overall)), "financial_risk_score": materiality, "compliance_score": max(0, 100 - int(overall * 0.55)), "partner_risk_score": 0, "risk_level": _risk_level(overall), "weights": {"tax_divergence": 0.25, "financial_materiality": 0.25, "recurrence_factor": 0.15, "legal_risk": 0.20, "confidence": 0.15}}
+
+def build_final_analysis_schema(mem: InvestigationMemory, analytics: Dict[str, Any], graph: EvidenceGraph, periodo: Optional[str]) -> Dict[str, Any]:
+    normalized = normalize_sped_data(mem.evidence); deterministic = run_deterministic_analysis(normalized)
+    financial = calculate_financial_summary(deterministic); legal = run_legal_analysis(normalized, deterministic); bi = build_business_intelligence(deterministic, analytics); scoring = calculate_scores(financial, legal, deterministic)
+    evidence = [{"source": e.get("source"), "registro": e.get("registro"), "topic": e.get("topic"), "chunk": e.get("chunk"), "confidence_score": round(float(e.get("score") or 0), 2)} for e in mem.evidence[:AGENT_EVIDENCE_BUDGET]]
+    return {"metadata": {"periodo": periodo or "periodo_nao_detectado", "engine_mode": "monolithic_main_py", "llm_role": "narrative_only", "records_analyzed": normalized.get("record_count", 0)}, "financial_layer": financial, "legal_layer": legal, "business_intelligence": bi, "scoring": scoring, "deterministic_analysis": deterministic, "narrative": {"status": "pending_llm_generation"}, "evidence": evidence, "graph": graph.export()}
+
+
 def compress_context(evidence: List[Dict[str,Any]], topn: int = AGENT_COMPRESSION_TOPN) -> str:
     """
     Compressão de contexto:
@@ -1347,12 +1442,15 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
         except Exception as e:
             print(f"[ORCH][{job_id}] driva opcional falhou: {e}")
 
-    # 👇 SEMPRE fora do try/except
+    # Analise deterministica monolitica: calculos, scoring, juridico e BI antes do LLM.
     analytics = build_analytics(mem)
+    structured_analysis = build_final_analysis_schema(mem, analytics, graph, periodo)
+    analytics["structured_analysis"] = structured_analysis
 
     trace.append({
-    "phase": "analytics",
-    "metrics": analytics
+        "phase": "analytics",
+        "metrics": analytics,
+        "structured_analysis_ready": True,
     })
     
     # ---------- FASE 3: SYNTH ----------
@@ -1368,6 +1466,7 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
         "markdown":     final_md,
         "periodo":      periodo,
         "analytics": analytics,
+        "structured_analysis": structured_analysis,
         "tokens": {
             "prompt":     tokens_total["prompt"],
             "completion": tokens_total["completion"],
@@ -1672,6 +1771,7 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                         # Metadados ficam fora do JSON visual do sumário
                         "mode": "agentic_v2",
                         "analytics": out.get("analytics"),
+                        "structured_analysis": out.get("structured_analysis"),
                         "model": out.get("model"),
                         "model_used": out.get("model"),
                         "tokens_used": tokens.get("total"),
