@@ -1405,26 +1405,31 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
     # ---------- SYNTH ----------
     job_update(job_id, stage="agent_synth", progress=90)
 
-    final_json_str, synth_usage = synthesizer_agent(
-        template,
-        periodo,
-        mem,
-        analytics,
-        graph,
-        model=model_synth
+    synth_out, synth_usage = synthesizer_agent(
+       template,
+       periodo,
+       mem,
+       analytics,
+       graph,
+       model=model_synth
     )
 
     tokens_total["prompt"]     += synth_usage.get("prompt_tokens", 0)
     tokens_total["completion"] += synth_usage.get("completion_tokens", 0)
 
     # 🔥 FIX CRÍTICO: parse + validação forte
-    try:
-        final_json = json.loads(final_json_str)
-    except Exception:
-        raise ValueError(f"Synth retornou JSON inválido: {final_json_str[:300]}")
+    if isinstance(synth_out, str):
+        try:
+            final_json = json.loads(synth_out)
+        except Exception:
+            raise ValueError(f"Synth retornou JSON inválido: {synth_out[:300]}")
+    elif isinstance(synth_out, dict):
+        final_json = synth_out
+    else:
+        raise ValueError(f"Synth retornou tipo inválido: {type(synth_out)}")
 
     final_report = FinalReport.model_validate(final_json)
-
+    
     trace.append({
         "phase": "synth",
         "prompt_tokens": synth_usage.get("prompt_tokens", 0),
