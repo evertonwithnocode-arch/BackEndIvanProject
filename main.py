@@ -446,7 +446,7 @@ def hybrid_search(
     """
     vs = get_vector_store(project_id)
     expanded = _expand_query(query)
-    pool_k = min(max(k * fetch_multiplier, 20), 80)
+    pool_k = min(max(k * 2, 10), 25)
 
     flt: Dict[str, Any] = {"source_kind": source_kind}
     if registro: flt["registro"] = registro
@@ -596,6 +596,68 @@ class EvidenceGraph:
 # ==============================================================================
 # CONTEXT COMPRESSOR
 # ==============================================================================
+def build_analytics(mem: InvestigationMemory) -> Dict[str, Any]:
+    """
+    Camada analítica REAL.
+    Aqui fazemos:
+    - agregações
+    - contagens
+    - cruzamentos
+    - métricas
+    - estatísticas
+    SEM usar LLM.
+    """
+
+    analytics = {
+        "registros": {},
+        "topics": {},
+        "sources": {},
+        "totals": {
+            "evidence_count": len(mem.evidence),
+        }
+    }
+
+    # =========================================================
+    # REGISTROS
+    # =========================================================
+
+    for reg, count in mem.registros_covered.items():
+        analytics["registros"][reg] = {
+            "count": count
+        }
+
+    # =========================================================
+    # TOPICS
+    # =========================================================
+
+    topic_counter = Counter()
+
+    for ev in mem.evidence:
+        topic = ev.get("topic")
+
+        if topic:
+            topic_counter[topic] += 1
+
+    for topic, count in topic_counter.items():
+        analytics["topics"][topic] = {
+            "evidence_count": count
+        }
+
+    # =========================================================
+    # SOURCES
+    # =========================================================
+
+    source_counter = Counter()
+
+    for ev in mem.evidence:
+        src = ev.get("source")
+
+        if src:
+            source_counter[src] += 1
+
+    analytics["sources"] = dict(source_counter)
+
+    return analytics
 def compress_context(evidence: List[Dict[str,Any]], topn: int = AGENT_COMPRESSION_TOPN) -> str:
     """
     Compressão de contexto:
@@ -725,10 +787,6 @@ NÃO escreva introduções como:
 "Claro", "Segue abaixo", "Aqui está o relatório", etc.
 
 NÃO envolva a resposta em blocos:
-
-
-
-
 ou qualquer cerca de código.
 
 Retorne Markdown PURO.
@@ -755,6 +813,32 @@ Hipóteses investigadas
 Lacunas conhecidas
 
 Produzir o SUMÁRIO FINAL obedecendo ESTRITAMENTE o template solicitado.
+
+REGRAS CRÍTICAS DE EVIDÊNCIA:
+
+- NÃO escreva:
+  "Não estimado"
+  "Não avaliado"
+  "Indefinido"
+  "Valores variados"
+  "Diversas ocorrências"
+  "Não disponível"
+
+- Se não houver dado objetivo:
+  OMITA COMPLETAMENTE a linha, coluna ou item.
+
+- NÃO invente ranges aproximados.
+- NÃO extrapole impacto financeiro.
+- NÃO estime ROI sem cálculo explícito nas evidências.
+- NÃO gere tabelas parcialmente vazias.
+
+- Só inclua tabelas se houver pelo menos:
+  - 2 linhas completas
+  - números reais
+  - evidência concreta
+
+- Se uma seção não possuir evidência suficiente:
+  remova a seção inteira do output final.   
 
 NÃO invente números.
 Toda afirmação numérica/fiscal deve estar baseada em evidências reais.
@@ -865,8 +949,8 @@ HIPÓTESES INVESTIGADAS:
 LACUNAS CONHECIDAS:
 {json.dumps(mem.gaps, ensure_ascii=False)}
 
-EVIDÊNCIAS (top-{AGENT_COMPRESSION_TOPN}, comprimidas):
-{compressed}
+ANALYTICS:
+{json.dumps(analytics, ensure_ascii=False)}
 
 Produza AGORA o sumário final em Markdown.
 """
@@ -909,7 +993,7 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
 
     # ---------- FASE 1: PLAN ----------
     job_update(job_id, stage="agent_plan")
-    plan = planner_agent(template, objective, model=model_planner)
+    plan = rule_based_planner(template, objective)
     u = plan.pop("_usage", {})
     tokens_total["prompt"]     += u.get("prompt_tokens", 0)
     tokens_total["completion"] += u.get("completion_tokens", 0)
@@ -1010,9 +1094,10 @@ def orchestrate_summary(req: "SummaryRequest", job_id: str) -> Dict[str, Any]:
         except Exception as e:
             print(f"[ORCH][{job_id}] driva opcional falhou: {e}")
 
+    analytics = build_analytics(mem)
     # ---------- FASE 3: SYNTH ----------
     job_update(job_id, stage="agent_synth", progress=90)
-    final_md, synth_usage = synthesizer_agent(template, periodo, mem, graph, model=model_synth)
+    final_md, synth_usage = synthesizer_agent(template, periodo, analytics, mem, graph, model=model_synth)
     tokens_total["prompt"]+=synth_usage.get("prompt_tokens",0)
     tokens_total["completion"]+=synth_usage.get("completion_tokens",0)
     trace.append({"phase":"synth","prompt_tokens":synth_usage.get("prompt_tokens",0),
