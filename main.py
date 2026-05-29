@@ -1684,7 +1684,15 @@ def process_summary_job(job_id: str, req: SummaryRequest):
                 print(f"[SUMMARY][{job_id}] ⚠️ orchestrator falhou: {e}")
                 print(traceback.format_exc())
 
-        _legacy_oneshot_summary(req, job_id, t0)
+                job_update(
+                job_id,
+                status="error",
+                stage="agentic_failed",
+                error=str(e)
+                )
+                raise
+
+        
 
     except Exception as e:
         print(traceback.format_exc())
